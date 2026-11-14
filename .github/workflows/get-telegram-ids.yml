@@ -7,10 +7,10 @@ jobs:
   get-ids:
     runs-on: ubuntu-latest
     steps:
-      - name: Leggi identificativi
+      - name: Verifica lettura secret
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-                run: |
+        run: |
           if [ -z "$BOT_TOKEN" ]; then
             echo "ERRORE: BOT_TOKEN non viene letto"
             exit 1
