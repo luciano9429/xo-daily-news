@@ -1,18 +1,23 @@
-name: Test Telegram API
+name: Recupera ID Telegram
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  get-ids:
     runs-on: ubuntu-latest
     steps:
-      - name: Verifica token Telegram
+      - name: Leggi aggiornamenti Telegram
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          echo "Lunghezza token: ${#BOT_TOKEN}"
-          echo "Inizio verifica API..."
-          curl -sS -o risposta.txt -w "HTTP STATUS: %{http_code}\n" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/getMe"
-          cat risposta.txt
+          response=$(curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates")
+          echo "$response" | jq -r '
+            if .ok == false then
+              "ERRORE: \(.description)"
+            else
+              .result[]? |
+              select(.message != null) |
+              "TESTO: \(.message.text // "senza testo")\nID GRUPPO: \(.message.chat.id)\nID TOPIC: \(.message.message_thread_id // "non trovato")"
+            end
+          '
