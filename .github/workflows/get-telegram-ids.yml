@@ -1,0 +1,19 @@
+name: Recupera ID Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  get-ids:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Leggi identificativi
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          response=$(curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates")
+          echo "$response" | jq -r '
+            .result[]?.message? |
+            select(.text? | startswith("/start@")) |
+            "ID GRUPPO: \(.chat.id)\nID TOPIC: \(.message_thread_id // "non trovato")"
+          '
