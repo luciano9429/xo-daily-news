@@ -32,7 +32,6 @@ jobs:
           import subprocess
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
-          from urllib.parse import quote
           from email.utils import parsedate_to_datetime
 
           import requests
@@ -51,9 +50,16 @@ jobs:
           SESSION = requests.Session()
           SESSION.headers.update(HEADERS)
 
+          RSS_FEEDS = {
+              "Billboard": "https://www.billboard.com/c/music/music-news/feed/",
+              "Rolling Stone": "https://www.rollingstone.com/music/rss/",
+              "Pitchfork": "https://pitchfork.com/rss/news/",
+          }
+
           def clean(text):
               return re.sub(
-                  r"\s+", " ",
+                  r"\s+",
+                  " ",
                   html.unescape(str(text or ""))
               ).strip()
 
@@ -62,7 +68,7 @@ jobs:
                   try:
                       response = SESSION.get(
                           url,
-                          timeout=20,
+                          timeout=25,
                           allow_redirects=True,
                           **kwargs
                       )
@@ -92,7 +98,9 @@ jobs:
                   if response:
                       data = response.json()
                       return "".join(
-                          part[0] for part in data[0] if part[0]
+                          part[0]
+                          for part in data[0]
+                          if part[0]
                       )
 
               except Exception as e:
@@ -100,167 +108,90 @@ jobs:
 
               return text
 
+          def get_entry_text(entry):
+              parts = []
+
+              summary = entry.get("summary", "")
+              if summary:
+                  parts.append(
+                      BeautifulSoup(
+                          summary,
+                          "html.parser"
+                      ).get_text(" ", strip=True)
+                  )
+
+              for content in entry.get("content", []):
+                  value = content.get("value", "")
+                  if value:
+                      parts.append(
+                          BeautifulSoup(
+                              value,
+                              "html.parser"
+                          ).get_text(" ", strip=True)
+                      )
+
+              return clean(" ".join(parts))
+
+          def get_date(entry):
+              value = entry.get("published") or entry.get("updated")
+
+              if not value:
+                  return None
+
+              try:
+                  date = parsedate_to_datetime(value)
+
+                  if date.tzinfo is None:
+                      date = date.replace(tzinfo=timezone.utc)
+
+                  return date.astimezone(timezone.utc)
+
+              except Exception:
+                  return None
+
           def relevant(title, description):
               title = clean(title).lower()
               description = clean(description).lower()
 
-              # Il nome deve comparire nel titolo.
+              # Il nome deve essere nel titolo.
               if (
                   "the weeknd" not in title
                   and "abel tesfaye" not in title
               ):
                   return False
 
-              # Esclusione di argomenti chiaramente estranei.
               excluded = [
                   "stellar blade",
                   "shift up",
                   "playstation",
                   "xbox",
                   "nintendo",
-                  "video game",
-                  "gaming"
+                  "gaming",
+                  "video game"
               ]
 
               if any(word in title for word in excluded):
                   return False
 
-              # Esclude descrizioni che indicano un argomento
-              # completamente diverso da quello del titolo.
-              if (
-                  "the weeknd" not in description
-                  and "abel tesfaye" not in description
-                  and len(description) > 150
-              ):
-                  return False
-
               return True
 
-          def extract_article(url):
-              response = get(url)
+          def make_summary(text, title):
+              text = clean(text)
 
-              if not response:
+              if len(text) < 100:
                   return ""
 
-              try:
-                  soup = BeautifulSoup(
-                      response.text,
-                      "html.parser"
-                  )
-
-                  # Prima prova a recuperare il contenuto strutturato.
-                  for script in soup.find_all(
-                      "script",
-                      type="application/ld+json"
-                  ):
-                      try:
-                          data = json.loads(
-                              script.string or script.get_text()
-                          )
-
-                          objects = (
-                              data if isinstance(data, list)
-                              else [data]
-                          )
-
-                          for obj in objects:
-                              if not isinstance(obj, dict):
-                                  continue
-
-                              body = clean(
-                                  obj.get("articleBody", "")
-                              )
-
-                              if len(body) >= 250:
-                                  return body[:5000]
-
-                      except Exception:
-                          continue
-
-                  # Prova i paragrafi dell'articolo.
-                  for tag in soup([
-                      "script", "style", "nav", "footer",
-                      "header", "aside", "form", "noscript"
-                  ]):
-                      tag.decompose()
-
-                  selectors = [
-                      "article p",
-                      '[itemprop="articleBody"] p',
-                      ".article-body p",
-                      ".article-content p",
-                      ".entry-content p",
-                      "main p"
-                  ]
-
-                  paragraphs = []
-
-                  for selector in selectors:
-                      for paragraph in soup.select(selector):
-                          text = clean(
-                              paragraph.get_text(" ", strip=True)
-                          )
-
-                          if len(text) >= 60:
-                              paragraphs.append(text)
-
-                      if len(paragraphs) >= 3:
-                          break
-
-                  unique = []
-                  seen = set()
-
-                  for paragraph in paragraphs:
-                      key = paragraph.lower()
-
-                      if key not in seen:
-                          seen.add(key)
-                          unique.append(paragraph)
-
-                  article = clean(" ".join(unique))
-
-                  if len(article) >= 250:
-                      return article[:5000]
-
-                  # Ultima possibilità: descrizione editoriale.
-                  for selector in [
-                      'meta[property="og:description"]',
-                      'meta[name="description"]',
-                      'meta[name="twitter:description"]'
-                  ]:
-                      tag = soup.select_one(selector)
-
-                      if tag and tag.get("content"):
-                          description = clean(tag["content"])
-
-                          if len(description) >= 160:
-                              return description
-
-                  return ""
-
-              except Exception as e:
-                  print("Estrazione articolo fallita:", e)
-                  return ""
-
-          def make_summary(article, title, source):
-              if not article:
-                  return ""
-
-              text = clean(article)
-              title_clean = clean(title).lower()
-              source_clean = clean(source).lower()
-
-              # Evita di riassumere descrizioni generiche.
+              # Rimuove descrizioni generiche e duplicazioni.
               generic = [
                   "google news",
                   "aggregated from sources",
-                  "aggregata da fonti di tutto il mondo",
-                  "copertura di notizie aggiornata e completa",
+                  "subscribe to our newsletter",
+                  "sign up for our newsletter",
                   "read more",
                   "click here"
               ]
 
-              if any(term in text.lower() for term in generic):
+              if any(word in text.lower() for word in generic):
                   return ""
 
               sentences = re.split(
@@ -269,27 +200,23 @@ jobs:
               )
 
               selected = []
+              title_lower = clean(title).lower()
 
               for sentence in sentences:
                   sentence = clean(sentence)
-                  lower = sentence.lower()
 
-                  if len(sentence) < 50:
+                  if len(sentence) < 40:
                       continue
 
-                  if lower == title_clean:
+                  if sentence.lower() == title_lower:
                       continue
 
-                  if source_clean and lower == source_clean:
-                      continue
-
-                  if any(term in lower for term in [
-                      "cookie",
-                      "subscribe",
-                      "sign up",
+                  if any(word in sentence.lower() for word in [
+                      "cookie policy",
                       "privacy policy",
                       "terms of service",
-                      "advertisement"
+                      "advertisement",
+                      "subscribe now"
                   ]):
                       continue
 
@@ -307,62 +234,45 @@ jobs:
 
               summary = clean(summary)
 
-              if len(summary) < 100:
+              if len(summary) < 90:
                   return ""
 
               if len(summary) > 650:
-                  summary = summary[:650].rsplit(" ", 1)[0] + "…"
+                  summary = (
+                      summary[:650].rsplit(" ", 1)[0] + "…"
+                  )
 
               return summary
 
           def news():
-              queries = [
-                  '"The Weeknd" OR "Abel Tesfaye" site:billboard.com',
-                  '"The Weeknd" OR "Abel Tesfaye" site:rollingstone.com',
-                  '"The Weeknd" OR "Abel Tesfaye" site:pitchfork.com',
-                  '"The Weeknd" OR "Abel Tesfaye" site:variety.com',
-                  '"The Weeknd" OR "Abel Tesfaye" site:universalmusic.com',
-                  '"The Weeknd" OR "Abel Tesfaye" site:livenation.com',
-                  '"The Weeknd" OR "Abel Tesfaye"'
-              ]
-
               found = {}
+
               cutoff = (
                   datetime.now(timezone.utc)
                   - timedelta(hours=48)
               )
 
-              for query in queries:
-                  url = (
-                      "https://news.google.com/rss/search?q="
-                      + quote(query + " when:2d")
-                      + "&hl=en-US&gl=US&ceid=US:en"
-                  )
+              for source, feed_url in RSS_FEEDS.items():
+                  print("Controllo feed:", source)
 
-                  response = get(url)
+                  response = get(feed_url)
 
                   if not response:
+                      print("Feed non raggiungibile:", source)
                       continue
 
                   feed = feedparser.parse(response.content)
 
+                  print(
+                      source,
+                      "articoli nel feed:",
+                      len(feed.entries)
+                  )
+
                   for entry in feed.entries:
                       title = clean(entry.get("title", ""))
                       link = entry.get("link", "")
-
-                      description = clean(
-                          BeautifulSoup(
-                              entry.get("summary", ""),
-                              "html.parser"
-                          ).get_text(" ")
-                      )
-
-                      source = clean(
-                          entry.get("source", {}).get(
-                              "title",
-                              "Fonte non indicata"
-                          )
-                      )
+                      description = get_entry_text(entry)
 
                       if not title or not link:
                           continue
@@ -370,22 +280,10 @@ jobs:
                       if not relevant(title, description):
                           continue
 
-                      published = entry.get("published")
+                      date = get_date(entry)
 
-                      if published:
-                          try:
-                              dt = parsedate_to_datetime(published)
-
-                              if dt.tzinfo is None:
-                                  dt = dt.replace(
-                                      tzinfo=timezone.utc
-                                  )
-
-                              if dt < cutoff:
-                                  continue
-
-                          except Exception:
-                              pass
+                      if date and date < cutoff:
+                          continue
 
                       key = re.sub(
                           r"[^a-z0-9]",
@@ -398,40 +296,44 @@ jobs:
                               "title": title,
                               "link": link,
                               "source": source,
-                              "description": description
+                              "description": description,
+                              "date": date
                           }
+
+                      elif len(description) > len(
+                          found[key]["description"]
+                      ):
+                          found[key]["description"] = description
+
+              # Prima gli articoli più recenti.
+              articles = list(found.values())
+
+              articles.sort(
+                  key=lambda x: x["date"] or datetime.min.replace(
+                      tzinfo=timezone.utc
+                  ),
+                  reverse=True
+              )
 
               results = []
 
-              for item in found.values():
+              for item in articles:
                   if len(results) >= 5:
                       break
 
                   print(
-                      "Controllo articolo:",
-                      item["title"]
-                  )
-
-                  article = extract_article(item["link"])
-
-                  # Se il testo completo non è disponibile,
-                  # utilizza solo una descrizione RSS sufficientemente
-                  # informativa e non generica.
-                  if len(article) < 180:
-                      candidate = item["description"]
-
-                      if (
-                          len(candidate) >= 180
-                          and "google news" not in candidate.lower()
-                      ):
-                          article = candidate
-
-                  item["summary"] = make_summary(
-                      article,
+                      "Elaboro articolo:",
                       item["title"],
+                      "| Fonte:",
                       item["source"]
                   )
 
+                  summary = make_summary(
+                      item["description"],
+                      item["title"]
+                  )
+
+                  item["summary"] = summary
                   results.append(item)
 
               return results
@@ -518,7 +420,6 @@ jobs:
                                   upload_date,
                                   "%Y%m%d"
                               ).replace(tzinfo=timezone.utc)
-
                           except Exception:
                               continue
 
@@ -571,7 +472,7 @@ jobs:
                           )
                       else:
                           lines.append(
-                              "Contenuto non disponibile per un riassunto affidabile."
+                              "Descrizione editoriale non disponibile."
                           )
 
                       lines.append(
@@ -674,8 +575,6 @@ jobs:
                   "Invio Telegram fallito dopo 3 tentativi"
               )
 
-          # I test manuali funzionano a qualsiasi ora.
-          # Lo schedule pubblica soltanto alle 09:00 italiane.
           if (
               os.getenv("GITHUB_EVENT_NAME") == "schedule"
               and NOW.hour != 9
@@ -685,7 +584,7 @@ jobs:
               )
               raise SystemExit(0)
 
-          print("Ricerca notizie...")
+          print("Ricerca notizie tramite RSS diretti...")
           articles = news()
           print("Notizie trovate:", len(articles))
 
@@ -700,9 +599,7 @@ jobs:
 
           send(message)
 
-          print(
-              "XO Daily News pubblicato correttamente."
-          )
+          print("XO Daily News pubblicato correttamente.")
           PY
 
           python daily.py
