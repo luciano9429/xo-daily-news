@@ -27,7 +27,8 @@ jobs:
           import os, re, html, json, time, subprocess
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
-          from urllib.parse import quote
+          from urllib.parse import quote, urlparse
+          from email.utils import parsedate_to_datetime
           import requests
           import feedparser
           from bs4 import BeautifulSoup
@@ -36,20 +37,23 @@ jobs:
           TOPIC_ID = 40
           TZ = ZoneInfo("Europe/Rome")
           NOW = datetime.now(TZ)
-          HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; XODailyNews/1.0)"}
+          HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
           SESSION = requests.Session()
           SESSION.headers.update(HEADERS)
 
           def get(url, **kwargs):
               for attempt in range(3):
                   try:
-                      r = SESSION.get(url, timeout=20, **kwargs)
+                      r = SESSION.get(url, timeout=20, allow_redirects=True, **kwargs)
                       r.raise_for_status()
                       return r
                   except Exception as e:
                       print(f"GET tentativo {attempt+1}: {e}")
                       time.sleep(2)
               return None
+
+          def clean(text):
+              return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
 
           def translate(text):
               if not text:
@@ -59,88 +63,169 @@ jobs:
                   params = {"client":"gtx","sl":"auto","tl":"it","dt":"t","q":text[:3500]}
                   r = get(url, params=params)
                   if r:
-                      data = r.json()
-                      return "".join(x[0] for x in data[0] if x[0])
+                      return "".join(x[0] for x in r.json()[0] if x[0])
               except Exception as e:
                   print("Traduzione non disponibile:", e)
               return text
 
-          def clean(text):
-              return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+          def relevant(title, description):
+              title = clean(title).lower()
+              desc = clean(description).lower()
 
-          def article_summary(url, fallback):
+              # Il nome deve comparire nel titolo, non solo nel testo generico.
+              if "the weeknd" not in title and "abel tesfaye" not in title:
+                  return False
+
+              # Esclude risultati in cui il nome appare in un contesto estraneo.
+              unrelated = [
+                  "stellar blade", "shift up", "game developer",
+                  "video game", "gaming", "playstation",
+                  "xbox", "nintendo"
+              ]
+              if any(word in title for word in unrelated):
+                  return False
+
+              # Evita risultati con il nome citato solo incidentalmente.
+              if len(desc) > 100 and not any(
+                  term in desc for term in [
+                      "the weeknd", "abel tesfaye", "his music",
+                      "his album", "his tour", "his song",
+                      "his concert", "his performance"
+                  ]
+              ):
+                  return False
+
+              return True
+
+          def extract_article(url):
               r = get(url)
               if not r:
                   return ""
+
               try:
                   soup = BeautifulSoup(r.text, "html.parser")
-                  for tag in soup(["script","style","nav","footer","header","aside","form"]):
+
+                  for tag in soup(["script", "style", "nav", "footer",
+                                   "header", "aside", "form", "noscript"]):
                       tag.decompose()
 
-                  candidates = []
-                  for selector in ["article", '[itemprop="articleBody"]', "main"]:
-                      el = soup.select_one(selector)
-                      if el:
-                          candidates.append(el.get_text(" ", strip=True))
+                  blocks = []
+                  for selector in [
+                      "article p",
+                      '[itemprop="articleBody"] p',
+                      ".article-body p",
+                      ".article-content p",
+                      ".entry-content p",
+                      "main p"
+                  ]:
+                      for p in soup.select(selector):
+                          text = clean(p.get_text(" ", strip=True))
+                          if len(text) >= 50:
+                              blocks.append(text)
+                      if len(blocks) >= 3:
+                          break
 
-                  if not candidates:
-                      candidates.append(soup.get_text(" ", strip=True))
+                  # Mantiene i paragrafi distinti e rimuove duplicati.
+                  unique = []
+                  seen = set()
+                  for p in blocks:
+                      key = p.lower()
+                      if key not in seen:
+                          seen.add(key)
+                          unique.append(p)
 
-                  text = max(candidates, key=len)
-                  text = clean(text)
-                  if len(text) < 250:
+                  article = " ".join(unique)
+                  if len(article) < 250:
                       return ""
 
-                  title = clean(soup.title.get_text() if soup.title else "")
-                  if title and text.startswith(title):
-                      text = text[len(title):].strip()
+                  return article[:5000]
 
-                  text = re.sub(r"Cookie preferences|Accept all cookies|Privacy policy", "", text, flags=re.I)
-                  text = clean(text)
-
-                  if len(text) < 250:
-                      return ""
-
-                  summary = text[:1100]
-                  summary = translate(summary)
-                  return summary[:650].rsplit(" ", 1)[0] + "…" if len(summary) > 650 else summary
               except Exception as e:
-                  print("Errore lettura articolo:", e)
+                  print("Estrazione articolo fallita:", e)
                   return ""
+
+          def make_summary(article, title):
+              if not article:
+                  return ""
+
+              # Non usare mai il titolo come riassunto.
+              text = clean(article)
+              title_clean = clean(title).lower()
+
+              sentences = re.split(r"(?<=[.!?])\s+", text)
+              selected = []
+              for sentence in sentences:
+                  sentence = clean(sentence)
+                  if len(sentence) < 45:
+                      continue
+                  if sentence.lower() == title_clean:
+                      continue
+                  if any(x in sentence.lower() for x in [
+                      "cookie", "subscribe", "sign up", "privacy policy",
+                      "terms of service", "advertisement"
+                  ]):
+                      continue
+                  selected.append(sentence)
+                  if len(" ".join(selected)) >= 650:
+                      break
+
+              if not selected:
+                  return ""
+
+              summary = translate(" ".join(selected)[:2200])
+              summary = clean(summary)
+
+              if len(summary) < 80:
+                  return ""
+
+              return summary[:650].rsplit(" ", 1)[0] + "…" if len(summary) > 650 else summary
 
           def news():
               queries = [
                   '"The Weeknd" OR "Abel Tesfaye"',
-                  '"The Weeknd" interview OR tour OR music',
-                  '"The Weeknd" Italia OR concerto OR musica'
+                  '"The Weeknd" interview OR tour OR album',
+                  '"The Weeknd" music video OR Spotify OR concert',
+                  '"Abel Tesfaye" music OR interview OR performance'
               ]
+
               found = {}
               cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
 
               for q in queries:
-                  url = "https://news.google.com/rss/search?q=" + quote(q + " when:2d") + "&hl=en-US&gl=US&ceid=US:en"
+                  url = (
+                      "https://news.google.com/rss/search?q="
+                      + quote(q + " when:2d")
+                      + "&hl=en-US&gl=US&ceid=US:en"
+                  )
                   r = get(url)
                   if not r:
                       continue
+
                   feed = feedparser.parse(r.content)
 
                   for entry in feed.entries:
                       title = clean(entry.get("title", ""))
                       link = entry.get("link", "")
-                      desc = clean(BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" "))
+                      desc = clean(
+                          BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ")
+                      )
+
                       if not title or not link:
                           continue
 
-                      combined = (title + " " + desc).lower()
-                      if not any(x in combined for x in ["the weeknd", "abel tesfaye"]):
+                      if not relevant(title, desc):
                           continue
 
-                      published = entry.get("published_parsed")
+                      published = entry.get("published")
                       if published:
-                          from time import mktime
-                          dt = datetime.fromtimestamp(mktime(published), timezone.utc)
-                          if dt < cutoff:
-                              continue
+                          try:
+                              dt = parsedate_to_datetime(published)
+                              if dt.tzinfo is None:
+                                  dt = dt.replace(tzinfo=timezone.utc)
+                              if dt < cutoff:
+                                  continue
+                          except Exception:
+                              pass
 
                       key = re.sub(r"[^a-z0-9]", "", title.lower())
                       if key not in found:
@@ -152,17 +237,16 @@ jobs:
                           }
 
               results = []
+
               for item in found.values():
                   if len(results) >= 5:
                       break
-                  summary = article_summary(item["link"], item["description"])
-                  if not summary:
-                      summary = translate(item["description"])
-                  if summary and any(x in summary.lower() for x in [
-                      "google news", "aggregated from sources", "copertura di notizie aggiornata",
-                      "aggregata da fonti di tutto il mondo"
-                  ]):
-                      summary = ""
+
+                  print("Controllo articolo:", item["title"])
+                  article = extract_article(item["link"])
+                  summary = make_summary(article, item["title"])
+
+                  # Se non è disponibile il testo reale, non inventa un riassunto.
                   item["summary"] = summary
                   results.append(item)
 
@@ -175,6 +259,7 @@ jobs:
                   "The Weeknd music video",
                   "Abel Tesfaye interview"
               ]
+
               videos = {}
               cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
@@ -186,14 +271,17 @@ jobs:
                           "ytsearch8:" + q
                       ]
                       p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                      if p.returncode != 0 and not p.stdout:
-                          print("Ricerca YouTube non riuscita:", p.stderr[-500:])
+
+                      if not p.stdout:
+                          print("Nessun risultato YouTube per:", q)
                           continue
 
                       data = json.loads(p.stdout)
+
                       for v in data.get("entries", []):
                           if not v:
                               continue
+
                           title = clean(v.get("title", ""))
                           channel = clean(v.get("channel", "") or v.get("uploader", ""))
                           vid = v.get("id", "")
@@ -201,6 +289,7 @@ jobs:
 
                           if not vid or not date:
                               continue
+
                           if not any(x in (title + " " + channel).lower()
                                      for x in ["weeknd", "abel tesfaye", "xo"]):
                               continue
@@ -218,6 +307,7 @@ jobs:
                               "channel": channel,
                               "url": "https://www.youtube.com/watch?v=" + vid
                           }
+
                   except Exception as e:
                       print("Errore YouTube:", e)
 
@@ -237,17 +327,29 @@ jobs:
                   for i, a in enumerate(articles, 1):
                       lines.append(f"<b>{i}. {escape(a['title'])}</b>")
                       lines.append("Fonte: " + escape(a["source"]))
+
                       if a["summary"]:
                           lines.append(escape(a["summary"]))
-                      lines.append(f'<a href="{html.escape(a["link"], quote=True)}">Leggi la notizia</a>')
+                      else:
+                          lines.append("Testo completo non disponibile: consulta la fonte.")
+
+                      lines.append(
+                          f'<a href="{html.escape(a["link"], quote=True)}">Leggi la notizia</a>'
+                      )
                       lines.append("")
               else:
-                  lines.extend(["Nessuna nuova notizia pertinente nelle ultime 48 ore.", ""])
+                  lines.extend([
+                      "Nessuna nuova notizia pertinente nelle ultime 48 ore.",
+                      ""
+                  ])
 
               lines.extend(["🎬 <b>NUOVI VIDEO YOUTUBE</b>", ""])
+
               if videos:
                   for v in videos:
-                      lines.append(f'• <a href="{html.escape(v["url"], quote=True)}">{escape(v["title"])}</a>')
+                      lines.append(
+                          f'• <a href="{html.escape(v["url"], quote=True)}">{escape(v["title"])}</a>'
+                      )
                       lines.append("Canale: " + escape(v["channel"]))
               else:
                   lines.append("Nessun nuovo video pertinente nelle ultime 24 ore.")
@@ -258,10 +360,12 @@ jobs:
                   '<a href="https://www.instagram.com/theweeknd/">Profilo ufficiale @theweeknd</a>',
                   '<a href="https://www.instagram.com/abelspost/">Fanpage @abelspost</a>'
               ])
+
               return "\n".join(lines)
 
           def send(message):
               url = f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage"
+
               payload = {
                   "chat_id": CHAT_ID,
                   "message_thread_id": TOPIC_ID,
@@ -269,17 +373,22 @@ jobs:
                   "parse_mode": "HTML",
                   "disable_web_page_preview": True
               }
+
               for attempt in range(3):
                   try:
                       r = requests.post(url, data=payload, timeout=30)
                       print("Telegram:", r.status_code, r.text[:500])
                       r.raise_for_status()
+
                       if not r.json().get("ok"):
                           raise RuntimeError(r.text)
+
                       return
+
                   except Exception as e:
                       print(f"Invio Telegram tentativo {attempt+1}: {e}")
                       time.sleep(3)
+
               raise RuntimeError("Invio Telegram fallito dopo 3 tentativi")
 
           if os.getenv("GITHUB_EVENT_NAME") == "schedule" and NOW.hour != 9:
