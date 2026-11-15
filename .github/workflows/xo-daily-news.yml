@@ -39,8 +39,12 @@ jobs:
 
           CHAT_ID = "-1004476534522"
           TOPIC_ID = 40
+
           NOW = datetime.now(ZoneInfo("Europe/Rome"))
           UTC_NOW = datetime.now(timezone.utc)
+
+          NEWS_CUTOFF = UTC_NOW - timedelta(days=7)
+          VIDEO_CUTOFF = UTC_NOW - timedelta(days=7)
 
           HEADERS = {
               "User-Agent": (
@@ -51,9 +55,6 @@ jobs:
 
           SESSION = requests.Session()
           SESSION.headers.update(HEADERS)
-
-          CUTOFF_NEWS = UTC_NOW - timedelta(days=7)
-          CUTOFF_VIDEO = UTC_NOW - timedelta(hours=48)
 
           RSS_FEEDS = {
               "Pitchfork": "https://pitchfork.com/feed/feed-news/rss",
@@ -68,15 +69,17 @@ jobs:
 
           def clean(value):
               return re.sub(
-                  r"\s+", " ",
+                  r"\s+",
+                  " ",
                   html.unescape(str(value or ""))
               ).strip()
 
-          def get(url, timeout=25):
+          def get(url, params=None, timeout=25):
               for attempt in range(3):
                   try:
                       response = SESSION.get(
                           url,
+                          params=params,
                           timeout=timeout,
                           allow_redirects=True
                       )
@@ -94,32 +97,37 @@ jobs:
                   return ""
 
               try:
-                  response = SESSION.get(
+                  response = get(
                       "https://translate.googleapis.com/translate_a/single",
                       params={
                           "client": "gtx",
                           "sl": "auto",
                           "tl": "it",
                           "dt": "t",
-                          "q": text[:4500]
-                      },
-                      timeout=25
+                          "q": text[:4000]
+                      }
                   )
-                  response.raise_for_status()
-                  data = response.json()
 
-                  return clean("".join(
-                      part[0]
-                      for part in data[0]
-                      if part[0]
-                  ))
+                  if response:
+                      data = response.json()
+                      result = "".join(
+                          part[0]
+                          for part in data[0]
+                          if part[0]
+                      )
+
+                      if result:
+                          return clean(result)
+
               except Exception as e:
                   print("Traduzione non disponibile:", e)
-                  return text
+
+              return text
 
           def parse_date(entry):
               for field in ("published_parsed", "updated_parsed"):
                   value = entry.get(field)
+
                   if value:
                       try:
                           return datetime(
@@ -128,10 +136,12 @@ jobs:
                           )
                       except Exception:
                           pass
+
               return None
 
           def article_text(url):
               response = get(url)
+
               if not response:
                   return ""
 
@@ -140,13 +150,16 @@ jobs:
                   "html.parser"
               )
 
-              # Prima prova: dati strutturati JSON-LD.
+              # Cerca il testo completo nei dati strutturati.
               for script in soup.find_all(
                   "script",
                   type="application/ld+json"
               ):
                   try:
-                      data = json.loads(script.string or script.get_text())
+                      data = json.loads(
+                          script.string or script.get_text()
+                      )
+
                       objects = data if isinstance(data, list) else [data]
 
                       for obj in objects:
@@ -157,13 +170,14 @@ jobs:
                               objects.extend(obj["@graph"])
 
                           body = obj.get("articleBody")
+
                           if body and len(clean(body)) > 200:
                               return clean(body)
 
                   except Exception:
                       continue
 
-              # Seconda prova: paragrafi del contenuto editoriale.
+              # Cerca i paragrafi dell'articolo.
               for selector in [
                   "article",
                   '[itemprop="articleBody"]',
@@ -173,6 +187,7 @@ jobs:
                   "main"
               ]:
                   container = soup.select_one(selector)
+
                   if not container:
                       continue
 
@@ -182,8 +197,7 @@ jobs:
                   ]
 
                   paragraphs = [
-                      p for p in paragraphs
-                      if len(p) > 45
+                      p for p in paragraphs if len(p) > 45
                   ]
 
                   text = clean(" ".join(paragraphs))
@@ -191,15 +205,17 @@ jobs:
                   if len(text) > 250:
                       return text[:7000]
 
-              # Ultima possibilità: metadati descrittivi.
+              # Ripiego sui metadati.
               for attr in [
                   {"property": "og:description"},
                   {"name": "description"},
                   {"name": "twitter:description"}
               ]:
                   tag = soup.find("meta", attrs=attr)
+
                   if tag and tag.get("content"):
                       value = clean(tag["content"])
+
                       if len(value) > 100:
                           return value
 
@@ -245,7 +261,7 @@ jobs:
                   if len(sentence) < 40:
                       continue
 
-                  if any(x in sentence.lower() for x in [
+                  if any(word in sentence.lower() for word in [
                       "cookie policy",
                       "privacy policy",
                       "terms of service",
@@ -257,23 +273,20 @@ jobs:
 
                   selected.append(sentence)
 
-                  if len(" ".join(selected)) >= 1000:
+                  # Limita l'estratto a poche frasi.
+                  if len(selected) >= 4:
                       break
 
               if not selected:
                   return ""
 
-              result = translate(
-                  " ".join(selected)[:4000]
-              )
+              original = " ".join(selected)
+              result = translate(original)
 
-              if len(result) < 100:
-                  return ""
+              if len(result) > 650:
+                  result = result[:650].rsplit(" ", 1)[0] + "…"
 
-              if len(result) > 750:
-                  result = result[:750].rsplit(" ", 1)[0] + "…"
-
-              return result
+              return result if len(result) >= 80 else ""
 
           def get_news():
               found = {}
@@ -282,6 +295,7 @@ jobs:
                   print("Controllo feed:", source)
 
                   response = get(feed_url)
+
                   if not response:
                       print("Feed non disponibile:", source)
                       continue
@@ -308,7 +322,7 @@ jobs:
 
                       date = parse_date(entry)
 
-                      if date and date < CUTOFF_NEWS:
+                      if date and date < NEWS_CUTOFF:
                           continue
 
                       key = re.sub(
@@ -350,10 +364,7 @@ jobs:
               results = []
 
               for article in articles[:5]:
-                  print(
-                      "Apro articolo:",
-                      article["title"]
-                  )
+                  print("Apro articolo:", article["title"])
 
                   full_text = article_text(article["link"])
 
@@ -368,13 +379,42 @@ jobs:
 
               return results
 
+          def video_date(video):
+              # Accetta solo date effettivamente verificate.
+              upload_date = video.get("upload_date")
+
+              if upload_date:
+                  try:
+                      return datetime.strptime(
+                          upload_date,
+                          "%Y%m%d"
+                      ).replace(tzinfo=timezone.utc)
+                  except Exception:
+                      pass
+
+              timestamp = (
+                  video.get("release_timestamp")
+                  or video.get("timestamp")
+              )
+
+              if timestamp:
+                  try:
+                      return datetime.fromtimestamp(
+                          timestamp,
+                          timezone.utc
+                      )
+                  except Exception:
+                      pass
+
+              return None
+
           def get_official_youtube():
               print("Controllo feed YouTube ufficiale...")
 
               response = get(YOUTUBE_OFFICIAL)
 
               if not response:
-                  print("Feed YouTube ufficiale non raggiungibile.")
+                  print("Feed ufficiale non raggiungibile.")
                   return []
 
               feed = feedparser.parse(response.content)
@@ -383,7 +423,6 @@ jobs:
               for entry in feed.entries:
                   title = clean(entry.get("title", ""))
                   link = entry.get("link", "")
-
                   published = entry.get("published_parsed")
 
                   if not title or not link or not published:
@@ -394,7 +433,7 @@ jobs:
                       tzinfo=timezone.utc
                   )
 
-                  if date < CUTOFF_VIDEO:
+                  if date < VIDEO_CUTOFF:
                       continue
 
                   videos.append({
@@ -404,7 +443,67 @@ jobs:
                       "date": date
                   })
 
+              print("Video ufficiali recenti:", len(videos))
               return videos
+
+          def inspect_video(video_id):
+              url = (
+                  "https://www.youtube.com/watch?v="
+                  + video_id
+              )
+
+              command = [
+                  "yt-dlp",
+                  "--dump-single-json",
+                  "--no-warnings",
+                  "--skip-download",
+                  "--socket-timeout", "20",
+                  url
+              ]
+
+              try:
+                  process = subprocess.run(
+                      command,
+                      capture_output=True,
+                      text=True,
+                      timeout=45
+                  )
+
+                  if process.returncode != 0:
+                      print(
+                          "Metadati non recuperati:",
+                          video_id,
+                          process.stderr[-250:]
+                      )
+                      return None
+
+                  data = json.loads(process.stdout)
+                  date = video_date(data)
+
+                  # Senza data verificata il video viene escluso.
+                  if not date or date < VIDEO_CUTOFF:
+                      return None
+
+                  title = clean(data.get("title", ""))
+                  channel = clean(
+                      data.get("channel", "")
+                      or data.get("uploader", "")
+                  )
+
+                  return {
+                      "title": title,
+                      "channel": channel,
+                      "url": url,
+                      "date": date
+                  }
+
+              except Exception as e:
+                  print(
+                      "Errore metadati video",
+                      video_id,
+                      e
+                  )
+                  return None
 
           def get_other_youtube():
               queries = [
@@ -413,22 +512,22 @@ jobs:
                   "Abel Tesfaye interview"
               ]
 
-              videos = {}
+              candidates = {}
 
               for query in queries:
-                  print("Ricerca video aggiuntiva:", query)
+                  print("Ricerca YouTube:", query)
+
+                  command = [
+                      "yt-dlp",
+                      "--flat-playlist",
+                      "--dump-single-json",
+                      "--no-warnings",
+                      "--ignore-errors",
+                      "--playlist-end", "8",
+                      "ytsearch8:" + query
+                  ]
 
                   try:
-                      command = [
-                          "yt-dlp",
-                          "--dump-json",
-                          "--flat-playlist",
-                          "--no-warnings",
-                          "--ignore-errors",
-                          "--playlist-end", "8",
-                          "ytsearch8:" + query
-                      ]
-
                       process = subprocess.run(
                           command,
                           capture_output=True,
@@ -436,10 +535,17 @@ jobs:
                           timeout=60
                       )
 
-                      for line in process.stdout.splitlines():
-                          try:
-                              video = json.loads(line)
-                          except Exception:
+                      if not process.stdout.strip():
+                          print(
+                              "Nessun risultato per:",
+                              query
+                          )
+                          continue
+
+                      data = json.loads(process.stdout)
+
+                      for video in data.get("entries", []):
+                          if not video:
                               continue
 
                           title = clean(video.get("title", ""))
@@ -448,62 +554,69 @@ jobs:
                               or video.get("uploader", "")
                           )
 
-                          video_id = video.get("id", "")
-
-                          if not video_id:
-                              continue
-
                           combined = (
                               title + " " + channel
                           ).lower()
 
-                          if not any(x in combined for x in [
+                          if not any(word in combined for word in [
                               "the weeknd",
                               "abel tesfaye"
                           ]):
                               continue
 
-                          upload_date = video.get("upload_date")
+                          video_id = video.get("id", "")
 
-                          if upload_date:
-                              try:
-                                  date = datetime.strptime(
-                                      upload_date,
-                                      "%Y%m%d"
-                                  ).replace(tzinfo=timezone.utc)
-
-                                  if date < CUTOFF_VIDEO:
-                                      continue
-                              except Exception:
-                                  pass
-
-                          videos[video_id] = {
-                              "title": title,
-                              "channel": channel,
-                              "url": (
-                                  "https://www.youtube.com/watch?v="
-                                  + video_id
-                              ),
-                              "date": None
-                          }
+                          if video_id:
+                              candidates[video_id] = {
+                                  "title": title,
+                                  "channel": channel
+                              }
 
                   except Exception as e:
-                      print("Ricerca YouTube supplementare fallita:", e)
+                      print("Errore ricerca:", e)
 
                   time.sleep(2)
 
-              return list(videos.values())
+              print(
+                  "Video candidati da verificare:",
+                  len(candidates)
+              )
+
+              verified = []
+
+              for video_id in list(candidates.keys())[:15]:
+                  video = inspect_video(video_id)
+
+                  if video:
+                      verified.append(video)
+
+                  time.sleep(1)
+
+              print(
+                  "Video di altri canali verificati:",
+                  len(verified)
+              )
+
+              return verified
 
           def get_videos():
               official = get_official_youtube()
               extra = get_other_youtube()
 
               combined = {}
-              for video in official + extra:
-                  key = video["url"].split("v=")[-1]
-                  combined[key] = video
 
-              return list(combined.values())[:8]
+              for video in official + extra:
+                  video_id = video["url"].split("v=")[-1]
+                  combined[video_id] = video
+
+              results = list(combined.values())
+
+              results.sort(
+                  key=lambda x: x["date"],
+                  reverse=True
+              )
+
+              return results[:8]
 
           def esc(value):
               return html.escape(str(value), quote=False)
@@ -531,7 +644,7 @@ jobs:
                           )
                       else:
                           lines.append(
-                              "Testo completo non recuperabile automaticamente."
+                              "Testo non sufficiente per un riassunto affidabile."
                           )
 
                       lines.append(
@@ -539,10 +652,12 @@ jobs:
                           + html.escape(article["link"], quote=True)
                           + '">Leggi la notizia</a>'
                       )
+
                       lines.append("")
+
               else:
                   lines.extend([
-                      "Nessuna nuova notizia pertinente trovata nei feed RSS negli ultimi 7 giorni.",
+                      "Nessuna nuova notizia pertinente trovata nei feed negli ultimi 7 giorni.",
                       ""
                   ])
 
@@ -561,13 +676,20 @@ jobs:
                           + '</a>'
                       )
 
-                      if video["channel"]:
-                          lines.append(
-                              "Canale: " + esc(video["channel"])
-                          )
+                      lines.append(
+                          "Canale: " + esc(video["channel"])
+                      )
+
+                      lines.append(
+                          "Caricato: "
+                          + video["date"].astimezone(
+                              ZoneInfo("Europe/Rome")
+                          ).strftime("%d/%m/%Y")
+                      )
+
               else:
                   lines.append(
-                      "Nessun video recente recuperato dai feed e dalla ricerca."
+                      "Nessun video recente con data di pubblicazione verificata."
                   )
 
               lines.extend([
@@ -621,6 +743,8 @@ jobs:
 
               raise RuntimeError("Invio Telegram fallito.")
 
+          # Il cron usa due orari UTC per coprire le 09:00 italiane
+          # sia in inverno sia in estate.
           if (
               os.getenv("GITHUB_EVENT_NAME") == "schedule"
               and NOW.hour != 9
@@ -628,17 +752,18 @@ jobs:
               print("Orario non previsto: salto.")
               raise SystemExit(0)
 
-          print("Avvio XO Daily News...")
+          print("Avvio ricerca notizie...")
           articles = get_news()
-          print("Notizie:", len(articles))
+          print("Notizie trovate:", len(articles))
 
+          print("Avvio ricerca video...")
           videos = get_videos()
-          print("Video:", len(videos))
+          print("Video verificati:", len(videos))
 
           message = build_message(articles, videos)
           send_telegram(message)
 
-          print("Pubblicazione completata.")
+          print("XO Daily News pubblicato.")
           PY
 
           python daily.py
