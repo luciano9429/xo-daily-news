@@ -27,12 +27,10 @@ jobs:
           import os
           import re
           import html
-          import json
           import time
           import subprocess
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
-          from email.utils import parsedate_to_datetime
 
           import requests
           import feedparser
@@ -44,23 +42,32 @@ jobs:
           NOW = datetime.now(TZ)
 
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+              "User-Agent": "Mozilla/5.0 (compatible; XODailyNews/1.0)"
           }
 
           SESSION = requests.Session()
           SESSION.headers.update(HEADERS)
 
+          # Feed RSS diretti
           RSS_FEEDS = {
-              "Billboard": "https://www.billboard.com/c/music/music-news/feed/",
-              "Rolling Stone": "https://www.rollingstone.com/music/rss/",
-              "Pitchfork": "https://pitchfork.com/rss/news/",
+              "Billboard": "https://www.billboard.com/feed/",
+              "Billboard Music": "https://www.billboard.com/c/music/feed/",
+              "Rolling Stone": "https://www.rollingstone.com/music/feed/",
+              "Rolling Stone Music News": "https://www.rollingstone.com/music/music-news/feed/",
+              "Pitchfork": "https://pitchfork.com/feed/rss",
+              "Pitchfork News": "https://pitchfork.com/rss/news/",
           }
 
-          def clean(text):
+          CUTOFF = (
+              datetime.now(timezone.utc)
+              - timedelta(days=7)
+          )
+
+          def clean(value):
               return re.sub(
                   r"\s+",
                   " ",
-                  html.unescape(str(text or ""))
+                  html.unescape(str(value or ""))
               ).strip()
 
           def get(url, **kwargs):
@@ -75,7 +82,9 @@ jobs:
                       response.raise_for_status()
                       return response
                   except Exception as e:
-                      print(f"GET tentativo {attempt + 1}: {e}")
+                      print(
+                          f"Errore GET {url}, tentativo {attempt + 1}: {e}"
+                      )
                       time.sleep(2)
               return None
 
@@ -84,44 +93,52 @@ jobs:
                   return ""
 
               try:
-                  url = "https://translate.googleapis.com/translate_a/single"
-                  params = {
-                      "client": "gtx",
-                      "sl": "auto",
-                      "tl": "it",
-                      "dt": "t",
-                      "q": text[:3500]
-                  }
-
-                  response = get(url, params=params)
+                  response = get(
+                      "https://translate.googleapis.com/translate_a/single",
+                      params={
+                          "client": "gtx",
+                          "sl": "auto",
+                          "tl": "it",
+                          "dt": "t",
+                          "q": text[:4000]
+                      }
+                  )
 
                   if response:
                       data = response.json()
-                      return "".join(
+                      return clean("".join(
                           part[0]
                           for part in data[0]
                           if part[0]
-                      )
+                      ))
 
               except Exception as e:
                   print("Traduzione non disponibile:", e)
 
               return text
 
-          def get_entry_text(entry):
+          def entry_date(entry):
+              for field in ("published_parsed", "updated_parsed"):
+                  value = entry.get(field)
+
+                  if value:
+                      try:
+                          from time import struct_time
+                          return datetime(
+                              *value[:6],
+                              tzinfo=timezone.utc
+                          )
+                      except Exception:
+                          pass
+
+              return None
+
+          def entry_description(entry):
               parts = []
 
-              summary = entry.get("summary", "")
-              if summary:
-                  parts.append(
-                      BeautifulSoup(
-                          summary,
-                          "html.parser"
-                      ).get_text(" ", strip=True)
-                  )
+              for field in ("summary", "description"):
+                  value = entry.get(field, "")
 
-              for content in entry.get("content", []):
-                  value = content.get("value", "")
                   if value:
                       parts.append(
                           BeautifulSoup(
@@ -130,30 +147,29 @@ jobs:
                           ).get_text(" ", strip=True)
                       )
 
-              return clean(" ".join(parts))
+              for item in entry.get("content", []):
+                  value = item.get("value", "")
 
-          def get_date(entry):
-              value = entry.get("published") or entry.get("updated")
+                  if value:
+                      parts.append(
+                          BeautifulSoup(
+                              value,
+                              "html.parser"
+                          ).get_text(" ", strip=True)
+                      )
 
-              if not value:
-                  return None
+              # Elimina duplicati e descrizioni ripetute.
+              unique = []
+              for part in parts:
+                  part = clean(part)
+                  if part and part not in unique:
+                      unique.append(part)
 
-              try:
-                  date = parsedate_to_datetime(value)
-
-                  if date.tzinfo is None:
-                      date = date.replace(tzinfo=timezone.utc)
-
-                  return date.astimezone(timezone.utc)
-
-              except Exception:
-                  return None
+              return clean(" ".join(unique))
 
           def relevant(title, description):
               title = clean(title).lower()
-              description = clean(description).lower()
 
-              # Il nome deve essere nel titolo.
               if (
                   "the weeknd" not in title
                   and "abel tesfaye" not in title
@@ -175,20 +191,21 @@ jobs:
 
               return True
 
-          def make_summary(text, title):
-              text = clean(text)
+          def make_summary(description, title):
+              text = clean(description)
 
               if len(text) < 100:
                   return ""
 
-              # Rimuove descrizioni generiche e duplicazioni.
               generic = [
                   "google news",
                   "aggregated from sources",
                   "subscribe to our newsletter",
                   "sign up for our newsletter",
                   "read more",
-                  "click here"
+                  "click here",
+                  "cookie policy",
+                  "privacy policy"
               ]
 
               if any(word in text.lower() for word in generic):
@@ -200,15 +217,14 @@ jobs:
               )
 
               selected = []
-              title_lower = clean(title).lower()
 
               for sentence in sentences:
                   sentence = clean(sentence)
 
-                  if len(sentence) < 40:
+                  if len(sentence) < 35:
                       continue
 
-                  if sentence.lower() == title_lower:
+                  if sentence.lower() == clean(title).lower():
                       continue
 
                   if any(word in sentence.lower() for word in [
@@ -222,19 +238,17 @@ jobs:
 
                   selected.append(sentence)
 
-                  if len(" ".join(selected)) >= 600:
+                  if len(" ".join(selected)) >= 700:
                       break
 
               if not selected:
                   return ""
 
               summary = translate(
-                  " ".join(selected)[:2500]
+                  " ".join(selected)[:3000]
               )
 
-              summary = clean(summary)
-
-              if len(summary) < 90:
+              if len(summary) < 80:
                   return ""
 
               if len(summary) > 650:
@@ -244,16 +258,11 @@ jobs:
 
               return summary
 
-          def news():
+          def get_news():
               found = {}
 
-              cutoff = (
-                  datetime.now(timezone.utc)
-                  - timedelta(hours=48)
-              )
-
               for source, feed_url in RSS_FEEDS.items():
-                  print("Controllo feed:", source)
+                  print("Controllo:", source)
 
                   response = get(feed_url)
 
@@ -265,24 +274,27 @@ jobs:
 
                   print(
                       source,
-                      "articoli nel feed:",
-                      len(feed.entries)
+                      "- articoli:",
+                      len(feed.entries),
+                      "- errore:",
+                      feed.bozo
                   )
 
                   for entry in feed.entries:
                       title = clean(entry.get("title", ""))
                       link = entry.get("link", "")
-                      description = get_entry_text(entry)
 
                       if not title or not link:
                           continue
 
+                      description = entry_description(entry)
+
                       if not relevant(title, description):
                           continue
 
-                      date = get_date(entry)
+                      date = entry_date(entry)
 
-                      if date and date < cutoff:
+                      if date and date < CUTOFF:
                           continue
 
                       key = re.sub(
@@ -305,7 +317,6 @@ jobs:
                       ):
                           found[key]["description"] = description
 
-              # Prima gli articoli più recenti.
               articles = list(found.values())
 
               articles.sort(
@@ -317,28 +328,16 @@ jobs:
 
               results = []
 
-              for item in articles:
-                  if len(results) >= 5:
-                      break
-
-                  print(
-                      "Elaboro articolo:",
-                      item["title"],
-                      "| Fonte:",
-                      item["source"]
+              for article in articles[:5]:
+                  article["summary"] = make_summary(
+                      article["description"],
+                      article["title"]
                   )
-
-                  summary = make_summary(
-                      item["description"],
-                      item["title"]
-                  )
-
-                  item["summary"] = summary
-                  results.append(item)
+                  results.append(article)
 
               return results
 
-          def youtube():
+          def get_youtube():
               queries = [
                   "The Weeknd interview",
                   "The Weeknd live performance",
@@ -347,61 +346,60 @@ jobs:
               ]
 
               videos = {}
-
               cutoff = (
                   datetime.now(timezone.utc)
-                  - timedelta(hours=24)
+                  - timedelta(days=7)
               )
 
               for query in queries:
+                  print("Ricerca YouTube:", query)
+
                   try:
                       command = [
                           "yt-dlp",
-                          "--flat-playlist",
                           "--dump-single-json",
                           "--no-warnings",
                           "--ignore-errors",
-                          "--playlist-end",
-                          "8",
-                          "ytsearch8:" + query
+                          "--skip-download",
+                          "--playlist-end", "10",
+                          "--socket-timeout", "20",
+                          "ytsearch10:" + query
                       ]
 
                       process = subprocess.run(
                           command,
                           capture_output=True,
                           text=True,
-                          timeout=60
+                          timeout=100
                       )
 
-                      if not process.stdout:
+                      if process.returncode != 0:
                           print(
-                              "Nessun risultato YouTube:",
-                              query
+                              "Avviso yt-dlp:",
+                              process.stderr[-500:]
                           )
+
+                      if not process.stdout.strip():
                           continue
 
+                      import json
                       data = json.loads(process.stdout)
 
-                      for video in data.get("entries", []):
+                      entries = data.get("entries", [])
+
+                      for video in entries:
                           if not video:
                               continue
 
-                          title = clean(
-                              video.get("title", "")
-                          )
-
+                          title = clean(video.get("title", ""))
                           channel = clean(
                               video.get("channel", "")
                               or video.get("uploader", "")
                           )
 
                           video_id = video.get("id", "")
-                          upload_date = video.get(
-                              "upload_date",
-                              ""
-                          )
 
-                          if not video_id or not upload_date:
+                          if not video_id:
                               continue
 
                           combined = (
@@ -415,16 +413,22 @@ jobs:
                           ]):
                               continue
 
-                          try:
-                              date = datetime.strptime(
-                                  upload_date,
-                                  "%Y%m%d"
-                              ).replace(tzinfo=timezone.utc)
-                          except Exception:
-                              continue
+                          upload_date = video.get("upload_date")
 
-                          if date < cutoff:
-                              continue
+                          if upload_date:
+                              try:
+                                  date = datetime.strptime(
+                                      upload_date,
+                                      "%Y%m%d"
+                                  ).replace(
+                                      tzinfo=timezone.utc
+                                  )
+
+                                  if date < cutoff:
+                                      continue
+
+                              except Exception:
+                                  pass
 
                           videos[video_id] = {
                               "title": title,
@@ -435,16 +439,18 @@ jobs:
                               )
                           }
 
+                  except subprocess.TimeoutExpired:
+                      print("Ricerca YouTube scaduta:", query)
+
                   except Exception as e:
                       print("Errore YouTube:", e)
 
+                  time.sleep(2)
+
               return list(videos.values())[:8]
 
-          def escape(text):
-              return html.escape(
-                  str(text),
-                  quote=False
-              )
+          def esc(text):
+              return html.escape(str(text), quote=False)
 
           def build_message(articles, videos):
               lines = [
@@ -454,25 +460,18 @@ jobs:
               ]
 
               if articles:
-                  for index, article in enumerate(
-                      articles,
-                      1
-                  ):
+                  for i, article in enumerate(articles, 1):
                       lines.append(
-                          f"<b>{index}. {escape(article['title'])}</b>"
+                          f"<b>{i}. {esc(article['title'])}</b>"
                       )
 
                       lines.append(
-                          "Fonte: " + escape(article["source"])
+                          "Fonte: " + esc(article["source"])
                       )
 
                       if article["summary"]:
                           lines.append(
-                              escape(article["summary"])
-                          )
-                      else:
-                          lines.append(
-                              "Descrizione editoriale non disponibile."
+                              esc(article["summary"])
                           )
 
                       lines.append(
@@ -488,7 +487,7 @@ jobs:
 
               else:
                   lines.extend([
-                      "Nessuna nuova notizia pertinente nelle ultime 48 ore.",
+                      "Nessuna nuova notizia pertinente trovata nei feed RSS negli ultimi 7 giorni.",
                       ""
                   ])
 
@@ -506,17 +505,18 @@ jobs:
                               quote=True
                           )
                           + '">'
-                          + escape(video["title"])
+                          + esc(video["title"])
                           + '</a>'
                       )
 
-                      lines.append(
-                          "Canale: " + escape(video["channel"])
-                      )
+                      if video["channel"]:
+                          lines.append(
+                              "Canale: " + esc(video["channel"])
+                          )
 
               else:
                   lines.append(
-                      "Nessun nuovo video pertinente nelle ultime 24 ore."
+                      "Nessun video pertinente recuperato dalla ricerca YouTube."
                   )
 
               lines.extend([
@@ -528,7 +528,7 @@ jobs:
 
               return "\n".join(lines)
 
-          def send(message):
+          def send_telegram(message):
               url = (
                   "https://api.telegram.org/bot"
                   + os.environ["BOT_TOKEN"]
@@ -552,7 +552,7 @@ jobs:
                       )
 
                       print(
-                          "Telegram:",
+                          "Risposta Telegram:",
                           response.status_code,
                           response.text[:500]
                       )
@@ -566,30 +566,33 @@ jobs:
 
                   except Exception as e:
                       print(
-                          f"Invio Telegram tentativo {attempt + 1}:",
+                          "Errore invio Telegram:",
+                          attempt + 1,
                           e
                       )
                       time.sleep(3)
 
               raise RuntimeError(
-                  "Invio Telegram fallito dopo 3 tentativi"
+                  "Impossibile pubblicare su Telegram."
               )
 
+          # Il cron gira alle 08:00 UTC in inverno
+          # e alle 07:00 UTC in estate: entrambi corrispondono
+          # alle 09:00 in Italia. Il secondo controllo evita
+          # il doppio invio.
           if (
               os.getenv("GITHUB_EVENT_NAME") == "schedule"
               and NOW.hour != 9
           ):
-              print(
-                  "Non sono le 09:00 in Italia: salto l'esecuzione."
-              )
+              print("Esecuzione non prevista: salto.")
               raise SystemExit(0)
 
-          print("Ricerca notizie tramite RSS diretti...")
-          articles = news()
+          print("Avvio ricerca notizie...")
+          articles = get_news()
           print("Notizie trovate:", len(articles))
 
-          print("Ricerca video YouTube...")
-          videos = youtube()
+          print("Avvio ricerca YouTube...")
+          videos = get_youtube()
           print("Video trovati:", len(videos))
 
           message = build_message(
@@ -597,9 +600,9 @@ jobs:
               videos
           )
 
-          send(message)
+          send_telegram(message)
 
-          print("XO Daily News pubblicato correttamente.")
+          print("XO Daily News pubblicato.")
           PY
 
           python daily.py
