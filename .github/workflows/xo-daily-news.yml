@@ -69,8 +69,7 @@ jobs:
 
           def clean(value):
               return re.sub(
-                  r"\s+",
-                  " ",
+                  r"\s+", " ",
                   html.unescape(str(value or ""))
               ).strip()
 
@@ -86,22 +85,22 @@ jobs:
                       response.raise_for_status()
                       return response
                   except Exception as e:
-                      print(
-                          f"Errore GET tentativo {attempt + 1}: {e}"
-                      )
+                      print("Errore GET:", attempt + 1, e)
                       time.sleep(2)
               return None
 
+          # Traduzione inglese -> italiano con due servizi gratuiti.
           def translate(text):
               if not text:
-                  return ""
+                  return None
 
+              # Primo tentativo: Google Translate.
               try:
                   response = get(
                       "https://translate.googleapis.com/translate_a/single",
                       params={
                           "client": "gtx",
-                          "sl": "auto",
+                          "sl": "en",
                           "tl": "it",
                           "dt": "t",
                           "q": text[:4000]
@@ -110,19 +109,50 @@ jobs:
 
                   if response:
                       data = response.json()
-                      result = "".join(
+                      result = clean("".join(
                           part[0]
                           for part in data[0]
                           if part[0]
-                      )
+                      ))
 
-                      if result:
-                          return clean(result)
+                      if result and result.lower() != text.lower():
+                          print("Traduzione Google riuscita.")
+                          return result
 
               except Exception as e:
-                  print("Traduzione non disponibile:", e)
+                  print("Google Translate non disponibile:", e)
 
-              return text
+              # Secondo tentativo: MyMemory.
+              try:
+                  response = get(
+                      "https://api.mymemory.translated.net/get",
+                      params={
+                          "q": text[:450],
+                          "langpair": "en|it"
+                      }
+                  )
+
+                  if response:
+                      data = response.json()
+                      result = clean(
+                          data.get("responseData", {}).get(
+                              "translatedText", ""
+                          )
+                      )
+
+                      if (
+                          result
+                          and data.get("responseStatus") == 200
+                          and result.lower() != text[:450].lower()
+                      ):
+                          print("Traduzione MyMemory riuscita.")
+                          return result
+
+              except Exception as e:
+                  print("MyMemory non disponibile:", e)
+
+              print("ERRORE: nessun servizio ha tradotto il testo.")
+              return None
 
           def parse_date(entry):
               for field in ("published_parsed", "updated_parsed"):
@@ -150,7 +180,6 @@ jobs:
                   "html.parser"
               )
 
-              # Cerca il testo completo nei dati strutturati.
               for script in soup.find_all(
                   "script",
                   type="application/ld+json"
@@ -177,7 +206,6 @@ jobs:
                   except Exception:
                       continue
 
-              # Cerca i paragrafi dell'articolo.
               for selector in [
                   "article",
                   '[itemprop="articleBody"]',
@@ -205,7 +233,6 @@ jobs:
                   if len(text) > 250:
                       return text[:7000]
 
-              # Ripiego sui metadati.
               for attr in [
                   {"property": "og:description"},
                   {"name": "description"},
@@ -273,7 +300,6 @@ jobs:
 
                   selected.append(sentence)
 
-                  # Limita l'estratto a poche frasi.
                   if len(selected) >= 4:
                       break
 
@@ -281,12 +307,17 @@ jobs:
                   return ""
 
               original = " ".join(selected)
-              result = translate(original)
+              translated = translate(original)
 
-              if len(result) > 650:
-                  result = result[:650].rsplit(" ", 1)[0] + "…"
+              if not translated:
+                  return ""
 
-              return result if len(result) >= 80 else ""
+              if len(translated) > 650:
+                  translated = (
+                      translated[:650].rsplit(" ", 1)[0] + "…"
+                  )
+
+              return translated
 
           def get_news():
               found = {}
@@ -380,7 +411,6 @@ jobs:
               return results
 
           def video_date(video):
-              # Accetta solo date effettivamente verificate.
               upload_date = video.get("upload_date")
 
               if upload_date:
@@ -480,29 +510,21 @@ jobs:
                   data = json.loads(process.stdout)
                   date = video_date(data)
 
-                  # Senza data verificata il video viene escluso.
                   if not date or date < VIDEO_CUTOFF:
                       return None
 
-                  title = clean(data.get("title", ""))
-                  channel = clean(
-                      data.get("channel", "")
-                      or data.get("uploader", "")
-                  )
-
                   return {
-                      "title": title,
-                      "channel": channel,
+                      "title": clean(data.get("title", "")),
+                      "channel": clean(
+                          data.get("channel", "")
+                          or data.get("uploader", "")
+                      ),
                       "url": url,
                       "date": date
                   }
 
               except Exception as e:
-                  print(
-                      "Errore metadati video",
-                      video_id,
-                      e
-                  )
+                  print("Errore metadati video:", video_id, e)
                   return None
 
           def get_other_youtube():
@@ -536,10 +558,6 @@ jobs:
                       )
 
                       if not process.stdout.strip():
-                          print(
-                              "Nessun risultato per:",
-                              query
-                          )
                           continue
 
                       data = json.loads(process.stdout)
@@ -567,20 +585,14 @@ jobs:
                           video_id = video.get("id", "")
 
                           if video_id:
-                              candidates[video_id] = {
-                                  "title": title,
-                                  "channel": channel
-                              }
+                              candidates[video_id] = True
 
                   except Exception as e:
-                      print("Errore ricerca:", e)
+                      print("Errore ricerca YouTube:", e)
 
                   time.sleep(2)
 
-              print(
-                  "Video candidati da verificare:",
-                  len(candidates)
-              )
+              print("Video da verificare:", len(candidates))
 
               verified = []
 
@@ -592,11 +604,7 @@ jobs:
 
                   time.sleep(1)
 
-              print(
-                  "Video di altri canali verificati:",
-                  len(verified)
-              )
-
+              print("Video verificati:", len(verified))
               return verified
 
           def get_videos():
@@ -644,7 +652,7 @@ jobs:
                           )
                       else:
                           lines.append(
-                              "Testo non sufficiente per un riassunto affidabile."
+                              "Traduzione o testo non disponibili."
                           )
 
                       lines.append(
@@ -657,7 +665,7 @@ jobs:
 
               else:
                   lines.extend([
-                      "Nessuna nuova notizia pertinente trovata nei feed negli ultimi 7 giorni.",
+                      "Nessuna nuova notizia pertinente trovata negli ultimi 7 giorni.",
                       ""
                   ])
 
@@ -689,7 +697,7 @@ jobs:
 
               else:
                   lines.append(
-                      "Nessun video recente con data di pubblicazione verificata."
+                      "Nessun video recente con data verificata."
                   )
 
               lines.extend([
@@ -743,8 +751,6 @@ jobs:
 
               raise RuntimeError("Invio Telegram fallito.")
 
-          # Il cron usa due orari UTC per coprire le 09:00 italiane
-          # sia in inverno sia in estate.
           if (
               os.getenv("GITHUB_EVENT_NAME") == "schedule"
               and NOW.hour != 9
