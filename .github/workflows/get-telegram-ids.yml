@@ -1,7 +1,6 @@
-YAML
 name: Test pubblicazione Telegram
 
-on:
+'on':
   workflow_dispatch:
 
 jobs:
@@ -15,4 +14,4 @@ jobs:
           curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d "chat_id=-1004476534522" \
             -d "message_thread_id=40" \
-            --data-urlencode "text=✅ Test riuscito! Il bot XO Daily News è collegato correttamente al topic."
+            --data-urlencode "text=Test riuscito! XO Daily News è collegato al topic."
