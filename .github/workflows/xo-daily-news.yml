@@ -10,6 +10,9 @@ jobs:
   daily-news:
     runs-on: ubuntu-latest
     steps:
+      - name: Installa strumento di ricerca YouTube
+        run: python -m pip install yt-dlp
+
       - name: Cerca notizie e nuovi video
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -23,8 +26,8 @@ jobs:
           import time
           import urllib.request
           import urllib.parse
-          import urllib.error
           import xml.etree.ElementTree as ET
+          import subprocess
           from html.parser import HTMLParser
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
@@ -39,7 +42,6 @@ jobs:
               "User-Agent": "Mozilla/5.0 (compatible; XODailyNews/1.0)"
           }
 
-          # Connessioni con tre tentativi e attese progressive.
           def request_retry(url, data=None, timeout=20):
               last_error = None
 
@@ -51,23 +53,18 @@ jobs:
                           headers=HEADERS,
                           method="POST" if data else "GET"
                       )
-
-                      with urllib.request.urlopen(
-                          req, timeout=timeout
-                      ) as response:
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
                           return response.read().decode(
                               response.headers.get_content_charset() or "utf-8",
                               errors="replace"
                           )
-
                   except Exception as e:
                       last_error = e
                       print(
-                          f"Tentativo {attempt}/3 fallito per "
-                          f"{url[:120]}: {type(e).__name__}: {e}",
+                          f"Tentativo {attempt}/3 per {url[:100]}: "
+                          f"{type(e).__name__}: {e}",
                           flush=True
                       )
-
                       if attempt < 3:
                           time.sleep(attempt * 3)
 
@@ -77,9 +74,7 @@ jobs:
               return request_retry(url, timeout=timeout)
 
           def clean(value):
-              value = html.unescape(
-                  re.sub(r"<[^>]+>", " ", value or "")
-              )
+              value = html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
               return re.sub(r"\s+", " ", value).strip()
 
           def esc(value):
@@ -89,9 +84,7 @@ jobs:
               if not value:
                   return None
               try:
-                  return parsedate_to_datetime(value).astimezone(
-                      timezone.utc
-                  )
+                  return parsedate_to_datetime(value).astimezone(timezone.utc)
               except Exception:
                   try:
                       return datetime.fromisoformat(
@@ -100,7 +93,6 @@ jobs:
                   except Exception:
                       return None
 
-          # Controllo orario solo per le esecuzioni automatiche.
           now = datetime.now(ZoneInfo("Europe/Rome"))
 
           if (
@@ -120,7 +112,6 @@ jobs:
           def translate(text):
               if not text:
                   return ""
-
               try:
                   url = (
                       "https://translate.googleapis.com/translate_a/single?"
@@ -132,17 +123,12 @@ jobs:
                           "q": text[:1500]
                       })
                   )
-
                   result = json.loads(fetch(url, timeout=15))
                   return "".join(
                       part[0] for part in result[0] if part[0]
                   )
-
               except Exception as e:
-                  print(
-                      "Traduzione non disponibile:",
-                      type(e).__name__, str(e)[:150]
-                  )
+                  print("Traduzione non disponibile:", str(e)[:150])
                   return text
 
           # -------------------------------------------------
@@ -159,19 +145,15 @@ jobs:
 
               def handle_starttag(self, tag, attrs):
                   attrs = dict(attrs)
-
                   if tag == "meta":
                       key = (
                           attrs.get("property")
                           or attrs.get("name")
                           or ""
                       ).lower()
-
                       value = attrs.get("content", "").strip()
-
                       if key and value:
                           self.meta[key] = value
-
                   elif tag == "p":
                       self.in_paragraph = True
                       self.current = ""
@@ -183,48 +165,58 @@ jobs:
               def handle_endtag(self, tag):
                   if tag == "p" and self.in_paragraph:
                       paragraph = clean(self.current)
-
                       if len(paragraph) > 70:
                           self.paragraphs.append(paragraph)
-
                       self.in_paragraph = False
                       self.current = ""
+
+          def useful_description(text, title):
+              text = clean(text)
+              if len(text) < 80:
+                  return False
+
+              lower = text.lower()
+              generic_phrases = [
+                  "google news",
+                  "aggregata da fonti di tutto il mondo",
+                  "copertura di notizie aggiornata e completa",
+                  "comprehensive up-to-date news coverage",
+                  "comprehensive news coverage",
+                  "news from around the world"
+              ]
+
+              if any(phrase in lower for phrase in generic_phrases):
+                  return False
+
+              if SequenceMatcher(
+                  None, text.lower(), title.lower()
+              ).ratio() > 0.88:
+                  return False
+
+              return True
 
           def get_summary(url, title):
               try:
                   page = fetch(url, timeout=20)
-
                   parser = ArticleParser()
                   parser.feed(page[:1000000])
 
-                  description = (
-                      parser.meta.get("og:description")
-                      or parser.meta.get("twitter:description")
-                      or parser.meta.get("description")
-                      or ""
+                  candidates = [
+                      parser.meta.get("og:description", ""),
+                      parser.meta.get("twitter:description", ""),
+                      parser.meta.get("description", "")
+                  ]
+
+                  candidates.extend(parser.paragraphs)
+
+                  description = next(
+                      (
+                          clean(candidate)
+                          for candidate in candidates
+                          if useful_description(candidate, title)
+                      ),
+                      ""
                   )
-
-                  description = clean(description)
-
-                  if (
-                      not description
-                      or SequenceMatcher(
-                          None,
-                          description.lower(),
-                          title.lower()
-                      ).ratio() > 0.72
-                  ):
-                      candidates = [
-                          p for p in parser.paragraphs
-                          if len(p) > 90
-                          and SequenceMatcher(
-                              None, p.lower(), title.lower()
-                          ).ratio() < 0.72
-                      ]
-
-                      description = (
-                          candidates[0] if candidates else ""
-                      )
 
                   if not description:
                       return ""
@@ -240,8 +232,7 @@ jobs:
 
               except Exception as e:
                   print(
-                      f"Descrizione non recuperata da {url[:100]}:",
-                      type(e).__name__, str(e)[:150]
+                      f"Descrizione non recuperata: {type(e).__name__}: {e}"
                   )
                   return ""
 
@@ -250,10 +241,9 @@ jobs:
           # -------------------------------------------------
 
           news = []
-          seen = set()
+          seen_news = set()
 
           query = '"The Weeknd" OR "Abel Tesfaye" when:2d'
-
           news_url = (
               "https://news.google.com/rss/search?"
               + urllib.parse.urlencode({
@@ -271,10 +261,7 @@ jobs:
               for item in root.findall(".//item"):
                   title = clean(item.findtext("title", ""))
                   link = item.findtext("link", "").strip()
-                  description = clean(
-                      item.findtext("description", "")
-                  )
-
+                  description = clean(item.findtext("description", ""))
                   source_el = item.find("source")
                   source = clean(
                       source_el.text if source_el is not None else ""
@@ -284,28 +271,20 @@ jobs:
                       continue
 
                   searchable = (title + " " + description).lower()
-
                   if (
                       "the weeknd" not in searchable
                       and "abel tesfaye" not in searchable
                   ):
                       continue
 
-                  published = parse_date(
-                      item.findtext("pubDate", "")
-                  )
-
+                  published = parse_date(item.findtext("pubDate", ""))
                   if published and published < cutoff_news:
                       continue
 
-                  key = re.sub(
-                      r"[^a-z0-9]", "", title.lower()
-                  )
-
-                  if key in seen:
+                  key = re.sub(r"[^a-z0-9]", "", title.lower())
+                  if key in seen_news:
                       continue
-
-                  seen.add(key)
+                  seen_news.add(key)
 
                   if source:
                       title = re.sub(
@@ -324,9 +303,7 @@ jobs:
                   if len(news) >= 5:
                       break
 
-              print(
-                  f"Google News: recuperate {len(news)} notizie."
-              )
+              print(f"Google News: {len(news)} notizie.")
 
           except Exception as e:
               print(
@@ -335,18 +312,57 @@ jobs:
               )
 
           # -------------------------------------------------
-          # VIDEO YOUTUBE UFFICIALI
+          # YOUTUBE: CANALE UFFICIALE + ALTRI CANALI
           # -------------------------------------------------
 
           videos = []
+          seen_videos = set()
 
-          youtube_url = (
-              "https://www.youtube.com/feeds/videos.xml"
-              "?channel_id=UC0WP5P-ufpRfjbNrmOWwLBQ"
-          )
+          def add_video(title, url, channel, upload_date=None):
+              title = clean(title)
+              if not title or not url:
+                  return
 
+              if upload_date:
+                  try:
+                      published = datetime.strptime(
+                          upload_date, "%Y%m%d"
+                      ).replace(tzinfo=timezone.utc)
+                      if published < cutoff_video:
+                          return
+                  except Exception:
+                      return
+              else:
+                  # Senza data verificabile non rischiamo
+                  # di ripubblicare vecchi video.
+                  return
+
+              searchable = (title + " " + channel).lower()
+
+              if not any(term in searchable for term in [
+                  "weeknd", "abel tesfaye", "xo"
+              ]):
+                  return
+
+              key = url.split("?")[0].rstrip("/")
+              if key in seen_videos:
+                  return
+
+              seen_videos.add(key)
+
+              videos.append({
+                  "title": title,
+                  "link": url,
+                  "channel": channel or "YouTube"
+              })
+
+          # Feed ufficiale: controllo aggiuntivo.
           try:
-              feed = fetch(youtube_url)
+              official_url = (
+                  "https://www.youtube.com/feeds/videos.xml"
+                  "?channel_id=UC0WP5P-ufpRfjbNrmOWwLBQ"
+              )
+              feed = fetch(official_url)
               root = ET.fromstring(feed)
 
               ns = {
@@ -354,44 +370,93 @@ jobs:
               }
 
               for entry in root.findall("atom:entry", ns):
-                  title = clean(
-                      entry.findtext("atom:title", "", ns)
-                  )
-
+                  title = entry.findtext("atom:title", "", ns)
                   link_el = entry.find("atom:link", ns)
-
                   link = (
                       link_el.attrib.get("href", "")
                       if link_el is not None else ""
                   )
-
                   published = parse_date(
                       entry.findtext("atom:published", "", ns)
                   )
 
-                  if not title or not link:
-                      continue
+                  upload_date = (
+                      published.strftime("%Y%m%d") if published else None
+                  )
 
-                  if published and published < cutoff_video:
-                      continue
-
-                  videos.append({
-                      "title": title,
-                      "link": link
-                  })
-
-                  if len(videos) >= 5:
-                      break
-
-              print(
-                  f"YouTube: recuperati {len(videos)} video."
-              )
+                  add_video(
+                      title, link, "The Weeknd Official", upload_date
+                  )
 
           except Exception as e:
-              print(
-                  "FEED YOUTUBE NON DISPONIBILE:",
-                  type(e).__name__, str(e)[:200]
-              )
+              print("Feed ufficiale YouTube non disponibile:", str(e)[:150])
+
+          # Ricerche su altri canali.
+          searches = [
+              "The Weeknd interview",
+              "The Weeknd live performance",
+              "The Weeknd music video",
+              "Abel Tesfaye interview"
+          ]
+
+          for search in searches:
+              if len(videos) >= 8:
+                  break
+
+              try:
+                  command = [
+                      "yt-dlp",
+                      "--flat-playlist",
+                      "--dump-single-json",
+                      "--no-warnings",
+                      "--ignore-errors",
+                      "--playlist-end", "8",
+                      "ytsearch8:" + search
+                  ]
+
+                  result = subprocess.run(
+                      command,
+                      capture_output=True,
+                      text=True,
+                      timeout=90
+                  )
+
+                  if result.returncode != 0 and not result.stdout.strip():
+                      print(
+                          "Ricerca YouTube non riuscita:",
+                          search,
+                          result.stderr[-300:]
+                      )
+                      continue
+
+                  data = json.loads(result.stdout)
+                  entries = data.get("entries", [])
+
+                  for entry in entries:
+                      if not entry:
+                          continue
+
+                      video_id = entry.get("id")
+                      url = entry.get("webpage_url")
+
+                      if not url and video_id:
+                          url = "https://www.youtube.com/watch?v=" + video_id
+
+                      add_video(
+                          entry.get("title", ""),
+                          url,
+                          entry.get("channel") or entry.get("uploader", ""),
+                          entry.get("upload_date")
+                      )
+
+              except Exception as e:
+                  print(
+                      f"Ricerca YouTube '{search}' non disponibile:",
+                      type(e).__name__, str(e)[:150]
+                  )
+
+          videos = videos[:8]
+          print(f"YouTube: {len(videos)} video recenti pertinenti.")
 
           # -------------------------------------------------
           # CREAZIONE MESSAGGIO
@@ -412,55 +477,46 @@ jobs:
                   lines.append(
                       f"<b>{index}. {esc(article['title'])}</b>"
                   )
-
                   lines.append(
                       f"<i>Fonte: {esc(article['source'])}</i>"
                   )
 
                   if summary:
                       lines.append(esc(summary))
-                  else:
-                      lines.append(
-                          "<i>Apri la fonte per leggere i dettagli.</i>"
-                      )
 
                   lines.append(
-                      f'<a href="{esc(article["link"])}">'
-                      "Leggi la notizia</a>"
+                      f'<a href="{esc(article["link"])}">Leggi la notizia</a>'
                   )
                   lines.append("")
-
           else:
-              lines.append(
-                  "Nessuna nuova notizia trovata."
-              )
-              lines.append("")
+              lines.extend([
+                  "Nessuna nuova notizia trovata.",
+                  ""
+              ])
 
           lines.append("<b>🎬 NUOVI VIDEO YOUTUBE</b>")
           lines.append("")
 
           if videos:
               for video in videos:
+                  lines.append(f"<b>{esc(video['title'])}</b>")
                   lines.append(
-                      f"<b>{esc(video['title'])}</b>"
+                      f"<i>Canale: {esc(video['channel'])}</i>"
                   )
                   lines.append(
-                      f'<a href="{esc(video["link"])}">'
-                      "Guarda il video</a>"
+                      f'<a href="{esc(video["link"])}">Guarda il video</a>'
                   )
                   lines.append("")
           else:
-              lines.append(
-                  "Nessun nuovo video nelle ultime 24 ore."
-              )
-              lines.append("")
+              lines.extend([
+                  "Nessun nuovo video pertinente nelle ultime 24 ore.",
+                  ""
+              ])
 
           lines.extend([
               "📸 <b>INSTAGRAM</b>",
-              '<a href="https://www.instagram.com/theweeknd/">'
-              "Profilo ufficiale @theweeknd</a>",
-              '<a href="https://www.instagram.com/abelspost/">'
-              "Fanpage @abelspost</a>"
+              '<a href="https://www.instagram.com/theweeknd/">Profilo ufficiale @theweeknd</a>',
+              '<a href="https://www.instagram.com/abelspost/">Fanpage @abelspost</a>'
           ])
 
           message = "\n".join(lines)
@@ -472,12 +528,10 @@ jobs:
               )
 
           # -------------------------------------------------
-          # INVIO TELEGRAM CON TRE TENTATIVI
+          # INVIO TELEGRAM
           # -------------------------------------------------
 
-          api_url = (
-              f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-          )
+          api_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
           payload = urllib.parse.urlencode({
               "chat_id": CHAT_ID,
@@ -504,13 +558,13 @@ jobs:
                   )
 
               print(
-                  "PUBBLICAZIONE RIUSCITA. "
-                  f"Notizie: {len(news)}. Video: {len(videos)}."
+                  f"PUBBLICAZIONE RIUSCITA: "
+                  f"{len(news)} notizie e {len(videos)} video."
               )
 
           except Exception as e:
               print(
-                  "ERRORE FINALE INVIO TELEGRAM:",
+                  "ERRORE INVIO TELEGRAM:",
                   type(e).__name__, str(e)
               )
               raise
