@@ -1,0 +1,153 @@
+name: XO Daily News
+
+'on':
+  schedule:
+    - cron: '0 7,8 * * *'
+  workflow_dispatch:
+
+jobs:
+  publish-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cerca e pubblica le notizie
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: '-1004476534522'
+          THREAD_ID: '40'
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import html
+          import urllib.request
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          from email.utils import parsedate_to_datetime
+          from html.parser import HTMLParser
+
+          # Alle 09:00 italiane: i due orari UTC coprono ora solare e legale.
+          now = datetime.now(ZoneInfo("Europe/Rome"))
+          if os.environ.get("EVENT_NAME") == "schedule" and now.hour != 9:
+              print("Non è l'orario previsto: nessun invio.")
+              raise SystemExit(0)
+
+          class TextExtractor(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+              def handle_data(self, data):
+                  self.parts.append(data)
+
+          def clean(value):
+              parser = TextExtractor()
+              parser.feed(value or "")
+              return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+
+          def translate(text):
+              if not text:
+                  return ""
+              try:
+                  params = urllib.parse.urlencode({
+                      "client": "gtx",
+                      "sl": "auto",
+                      "tl": "it",
+                      "dt": "t",
+                      "q": text[:1200]
+                  })
+                  url = "https://translate.googleapis.com/translate_a/single?" + params
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=12) as response:
+                      data = __import__("json").loads(response.read().decode())
+                  return "".join(part[0] for part in data[0] if part[0])
+              except Exception:
+                  return text
+
+          query = '("The Weeknd" OR "Abel Tesfaye" OR "XO") when:2d'
+          params = urllib.parse.urlencode({
+              "q": query,
+              "hl": "it",
+              "gl": "IT",
+              "ceid": "IT:it"
+          })
+          feed_url = "https://news.google.com/rss/search?" + params
+          req = urllib.request.Request(feed_url, headers={"User-Agent": "Mozilla/5.0"})
+
+          with urllib.request.urlopen(req, timeout=25) as response:
+              root = ET.fromstring(response.read())
+
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+          articles = []
+          seen = set()
+
+          for item in root.findall(".//item"):
+              title = clean(item.findtext("title", ""))
+              link = item.findtext("link", "")
+              description = clean(item.findtext("description", ""))
+              pubdate = item.findtext("pubDate", "")
+
+              if not title or not link:
+                  continue
+
+              try:
+                  date = parsedate_to_datetime(pubdate)
+                  if date.tzinfo is None:
+                      date = date.replace(tzinfo=timezone.utc)
+                  if date < cutoff:
+                      continue
+              except Exception:
+                  continue
+
+              key = title.lower()
+              if key in seen:
+                  continue
+              seen.add(key)
+              articles.append((date, title, description, link))
+
+          articles.sort(key=lambda x: x[0], reverse=True)
+          articles = articles[:5]
+
+          if not articles:
+              print("Nessuna notizia recente trovata. Nessun messaggio inviato.")
+              raise SystemExit(0)
+
+          lines = ["<b>📰 XO DAILY NEWS</b>",
+                   "<i>Le ultime notizie su The Weeknd e XO</i>", ""]
+
+          for i, (date, title, description, link) in enumerate(articles, 1):
+              title_it = translate(title)
+              summary_it = translate(description[:700]) if description else ""
+              if not summary_it:
+                  summary_it = "Leggi la notizia completa alla fonte."
+
+              lines.append(f"<b>{i}. {html.escape(title_it)}</b>")
+              lines.append(html.escape(summary_it[:450]))
+              lines.append(f'<a href="{html.escape(link, quote=True)}">Leggi la notizia</a>')
+              lines.append("")
+
+          message = "\n".join(lines)
+          if len(message) > 4000:
+              message = message[:3900] + "\n\n<i>XO Daily News</i>"
+
+          payload = urllib.parse.urlencode({
+              "chat_id": os.environ["CHAT_ID"],
+              "message_thread_id": os.environ["THREAD_ID"],
+              "text": message,
+              "parse_mode": "HTML",
+              "disable_web_page_preview": "true"
+          }).encode()
+
+          token = os.environ["BOT_TOKEN"]
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          req = urllib.request.Request(url, data=payload, method="POST")
+
+          with urllib.request.urlopen(req, timeout=25) as response:
+              result = __import__("json").loads(response.read().decode())
+
+          if not result.get("ok"):
+              raise RuntimeError("Telegram non ha accettato il messaggio.")
+
+          print(f"Pubblicate {len(articles)} notizie nel topic Telegram.")
+          PY
