@@ -1,23 +1,18 @@
-name: Recupera ID Telegram
+YAML
+name: Test pubblicazione Telegram
 
 on:
   workflow_dispatch:
 
 jobs:
-  get-ids:
+  send-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Leggi aggiornamenti Telegram
+      - name: Invia messaggio nel topic
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          response=$(curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates")
-          echo "$response" | jq -r '
-            if .ok == false then
-              "ERRORE: \(.description)"
-            else
-              .result[]? |
-              select(.message != null) |
-              "TESTO: \(.message.text // "senza testo")\nID GRUPPO: \(.message.chat.id)\nID TOPIC: \(.message.message_thread_id // "non trovato")"
-            end
-          '
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=-1004476534522" \
+            -d "message_thread_id=40" \
+            --data-urlencode "text=✅ Test riuscito! Il bot XO Daily News è collegato correttamente al topic."
