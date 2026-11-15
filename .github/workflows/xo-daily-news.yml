@@ -1,3 +1,4 @@
+
 name: XO Daily News
 
 'on':
@@ -6,109 +7,159 @@ name: XO Daily News
   workflow_dispatch:
 
 jobs:
-  publish-news:
+  daily-news:
     runs-on: ubuntu-latest
     steps:
-      - name: Cerca e pubblica le notizie
+      - name: Cerca, prepara e pubblica le notizie
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: '-1004476534522'
-          THREAD_ID: '40'
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import os
           import re
-          import json
           import html
-          import difflib
+          import json
           import urllib.request
           import urllib.parse
+          import urllib.error
           import xml.etree.ElementTree as ET
+          from html.parser import HTMLParser
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
-          from email.utils import parsedate_to_datetime
-          from html.parser import HTMLParser
+          from difflib import SequenceMatcher
 
+          CHAT_ID = "-1004476534522"
+          THREAD_ID = "40"
+          TOKEN = os.environ["BOT_TOKEN"]
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (compatible; XODailyNews/1.0)"
+          }
+
+          # Esecuzione alle 09:00 italiane, con entrambi gli orari
+          # UTC per gestire ora solare e ora legale.
           now = datetime.now(ZoneInfo("Europe/Rome"))
-
-          if os.environ["EVENT_NAME"] == "schedule" and now.hour != 9:
-              print("Non sono le 09:00 italiane: nessun invio.")
+          if now.hour != 9:
+              print("Non sono le 09:00 in Italia: salto l'esecuzione.")
               raise SystemExit(0)
 
-          class TextExtractor(HTMLParser):
+          def fetch(url, timeout=15):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return response.read().decode(
+                      response.headers.get_content_charset() or "utf-8",
+                      errors="replace"
+                  ), response.geturl()
+
+          class ArticleParser(HTMLParser):
               def __init__(self):
                   super().__init__()
-                  self.parts = []
+                  self.meta = {}
+                  self.paragraphs = []
+                  self.current = ""
+                  self.in_paragraph = False
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == "meta":
+                      key = (attrs.get("property") or attrs.get("name") or "").lower()
+                      value = attrs.get("content", "").strip()
+                      if key and value:
+                          self.meta[key] = value
+                  elif tag == "p":
+                      self.in_paragraph = True
+                      self.current = ""
 
               def handle_data(self, data):
-                  self.parts.append(data)
+                  if self.in_paragraph:
+                      self.current += data + " "
 
-          def clean(text):
-              parser = TextExtractor()
-              parser.feed(text or "")
-              return re.sub(
-                  r"\s+", " ", " ".join(parser.parts)
-              ).strip()
+              def handle_endtag(self, tag):
+                  if tag == "p" and self.in_paragraph:
+                      text = clean(self.current)
+                      if len(text) > 70:
+                          self.paragraphs.append(text)
+                      self.in_paragraph = False
+                      self.current = ""
+
+          def clean(value):
+              value = html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+              return re.sub(r"\s+", " ", value).strip()
 
           def translate(text):
               if not text:
                   return ""
-
               try:
-                  params = urllib.parse.urlencode({
+                  url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode({
                       "client": "gtx",
                       "sl": "auto",
                       "tl": "it",
                       "dt": "t",
-                      "q": text[:1000]
+                      "q": text[:1500]
                   })
-
-                  url = (
-                      "https://translate.googleapis.com/"
-                      "translate_a/single?" + params
-                  )
-
-                  req = urllib.request.Request(
-                      url,
-                      headers={"User-Agent": "Mozilla/5.0"}
-                  )
-
-                  with urllib.request.urlopen(req, timeout=15) as response:
-                      data = json.loads(response.read().decode())
-
-                  return "".join(
-                      part[0] for part in data[0] if part[0]
-                  )
-
-              except Exception:
+                  data, _ = fetch(url, timeout=12)
+                  result = json.loads(data)
+                  return "".join(part[0] for part in result[0] if part[0])
+              except Exception as e:
+                  print("Traduzione non disponibile:", str(e)[:150])
                   return text
 
-          def similar(a, b):
-              return difflib.SequenceMatcher(
-                  None, a.casefold(), b.casefold()
-              ).ratio() > 0.72
+          def get_summary(url, title):
+              try:
+                  page, final_url = fetch(url)
+                  parser = ArticleParser()
+                  parser.feed(page[:1000000])
 
+                  description = (
+                      parser.meta.get("og:description")
+                      or parser.meta.get("twitter:description")
+                      or parser.meta.get("description")
+                  )
+                  description = clean(description)
+
+                  # Se la descrizione manca o ripete il titolo,
+                  # prova a ricavare un passaggio dall'articolo.
+                  if not description or SequenceMatcher(
+                      None, description.lower(), title.lower()
+                  ).ratio() > 0.72:
+                      candidates = [
+                          p for p in parser.paragraphs
+                          if len(p) > 90
+                          and SequenceMatcher(
+                              None, p.lower(), title.lower()
+                          ).ratio() < 0.72
+                      ]
+                      description = candidates[0] if candidates else ""
+
+                  if not description:
+                      return ""
+
+                  description = translate(description)
+                  description = clean(description)
+
+                  if len(description) > 360:
+                      description = description[:357].rsplit(" ", 1)[0] + "..."
+
+                  return description
+
+              except Exception as e:
+                  print("Impossibile estrarre l'articolo:", str(e)[:150])
+                  return ""
+
+          # Feed Google News in italiano.
           query = '"The Weeknd" OR "Abel Tesfaye" when:2d'
-
-          params = urllib.parse.urlencode({
+          feed_url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
               "q": query,
               "hl": "it",
               "gl": "IT",
               "ceid": "IT:it"
           })
 
-          feed_url = (
-              "https://news.google.com/rss/search?" + params
-          )
-
-          req = urllib.request.Request(
-              feed_url,
-              headers={"User-Agent": "Mozilla/5.0"}
-          )
-
-          with urllib.request.urlopen(req, timeout=25) as response:
-              root = ET.fromstring(response.read())
+          try:
+              feed, _ = fetch(feed_url)
+              root = ET.fromstring(feed)
+          except Exception as e:
+              print("Errore nel recupero del feed:", e)
+              raise SystemExit(1)
 
           cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
           articles = []
@@ -116,67 +167,56 @@ jobs:
 
           for item in root.findall(".//item"):
               title = clean(item.findtext("title", ""))
+              link = item.findtext("link", "").strip()
               description = clean(item.findtext("description", ""))
-              link = item.findtext("link", "")
-              pubdate = item.findtext("pubDate", "")
-
-              source_element = item.find("source")
-              source = (
-                  clean(source_element.text)
-                  if source_element is not None else ""
-              )
-
-              searchable = (
-                  title + " " + description
-              ).casefold()
-
-              if (
-                  "the weeknd" not in searchable
-                  and "abel tesfaye" not in searchable
-              ):
-                  continue
+              source_el = item.find("source")
+              source = clean(source_el.text if source_el is not None else "")
 
               if not title or not link:
                   continue
 
-              try:
-                  date = parsedate_to_datetime(pubdate)
-
-                  if date.tzinfo is None:
-                      date = date.replace(tzinfo=timezone.utc)
-
-                  if date < cutoff:
-                      continue
-
-              except Exception:
+              searchable = (title + " " + description).lower()
+              if "the weeknd" not in searchable and "abel tesfaye" not in searchable:
                   continue
 
-              key = title.casefold()
+              pub_date = item.findtext("pubDate", "")
+              if pub_date:
+                  try:
+                      from email.utils import parsedate_to_datetime
+                      published = parsedate_to_datetime(pub_date)
+                      if published.tzinfo is None:
+                          published = published.replace(tzinfo=timezone.utc)
+                      if published < cutoff:
+                          continue
+                  except Exception:
+                      pass
 
+              key = re.sub(r"[^a-z0-9]", "", title.lower())
               if key in seen:
                   continue
-
               seen.add(key)
 
-              # Rimuove il nome della testata dal titolo.
-              clean_title = re.sub(
-                  r"\s+-\s+[^-]{2,60}$", "", title
-              ).strip()
+              # Rimuove l'eventuale nome della testata dal titolo.
+              if source:
+                  title = re.sub(
+                      r"\s*[-|–]\s*" + re.escape(source) + r"\s*$",
+                      "", title, flags=re.IGNORECASE
+                  )
 
               articles.append({
-                  "date": date,
-                  "title": clean_title,
-                  "description": description,
-                  "source": source,
-                  "link": link
+                  "title": title,
+                  "link": link,
+                  "source": source or "Fonte originale",
+                  "description": description
               })
 
-          articles.sort(
-              key=lambda article: article["date"],
-              reverse=True
-          )
+              if len(articles) >= 5:
+                  break
 
-          articles = articles[:5]
+          def telegram_escape(text):
+              return (text.replace("&", "&amp;")
+                          .replace("<", "&lt;")
+                          .replace(">", "&gt;"))
 
           lines = [
               "<b>📰 XO DAILY NEWS</b>",
@@ -184,76 +224,58 @@ jobs:
               ""
           ]
 
-          for i, article in enumerate(articles, 1):
-              title_it = translate(article["title"])
-              summary_it = translate(article["description"][:700])
-
-              lines.append(
-                  f"<b>{i}. {html.escape(title_it)}</b>"
-              )
-
-              if summary_it and not similar(title_it, summary_it):
-                  lines.append(html.escape(summary_it[:350]))
-
-              if article["source"]:
-                  source_text = html.escape(article["source"])
-                  lines.append(f"<i>Fonte: {source_text}</i>")
-
-              lines.append(
-                  f'<a href="{html.escape(article["link"], quote=True)}">'
-                  "Leggi la notizia</a>"
-              )
-
-              lines.append("")
-
           if not articles:
-              lines.append(
-                  "Nessuna nuova notizia pertinente nelle ultime 48 ore."
-              )
-              lines.append("")
+              lines.append("Nessuna nuova notizia pertinente trovata nelle ultime 48 ore.")
+          else:
+              for index, article in enumerate(articles, 1):
+                  summary = get_summary(article["link"], article["title"])
+
+                  lines.append(
+                      f"<b>{index}. {telegram_escape(article['title'])}</b>"
+                  )
+                  lines.append(
+                      f"<i>Fonte: {telegram_escape(article['source'])}</i>"
+                  )
+
+                  if summary:
+                      lines.append(telegram_escape(summary))
+                  else:
+                      lines.append(
+                          "<i>Apri la fonte per leggere tutti i dettagli.</i>"
+                      )
+
+                  lines.append(
+                      f'<a href="{html.escape(article["link"], quote=True)}">Leggi la notizia</a>'
+                  )
+                  lines.append("")
 
           lines.extend([
               "📸 <b>INSTAGRAM</b>",
-              '<a href="https://www.instagram.com/theweeknd/">'
-              "Profilo ufficiale @theweeknd</a>",
-              '<a href="https://www.instagram.com/abelspost/">'
-              "Fanpage @abelspost</a>"
+              '<a href="https://www.instagram.com/theweeknd/">Profilo ufficiale @theweeknd</a>',
+              '<a href="https://www.instagram.com/abelspost/">Fanpage @abelspost</a>'
           ])
 
           message = "\n".join(lines)
 
-          if len(message) > 4000:
-              message = message[:3900]
+          # Limite prudenziale rispetto ai 4096 caratteri di Telegram.
+          if len(message) > 3800:
+              message = message[:3750] + "\n\n<i>Altre notizie disponibili nei link.</i>"
 
+          api_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
           payload = urllib.parse.urlencode({
-              "chat_id": os.environ["CHAT_ID"],
-              "message_thread_id": os.environ["THREAD_ID"],
+              "chat_id": CHAT_ID,
+              "message_thread_id": THREAD_ID,
               "text": message,
               "parse_mode": "HTML",
               "disable_web_page_preview": "false"
           }).encode()
 
-          token = os.environ["BOT_TOKEN"]
-
-          url = (
-              f"https://api.telegram.org/bot{token}/sendMessage"
-          )
-
-          request = urllib.request.Request(
-              url,
-              data=payload,
-              method="POST"
-          )
-
-          with urllib.request.urlopen(request, timeout=30) as response:
+          req = urllib.request.Request(api_url, data=payload, method="POST")
+          with urllib.request.urlopen(req, timeout=20) as response:
               result = json.loads(response.read().decode())
 
           if not result.get("ok"):
-              raise RuntimeError(
-                  "Telegram non ha accettato il messaggio."
-              )
+              raise RuntimeError("Telegram non ha accettato il messaggio.")
 
-          print(
-              f"Pubblicazione completata: {len(articles)} notizie."
-          )
+          print("Notizie pubblicate correttamente.")
           PY
