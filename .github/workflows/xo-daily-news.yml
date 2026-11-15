@@ -20,7 +20,6 @@ jobs:
           import os
           import re
           import json
-          import html
           import urllib.request
           import urllib.parse
           import xml.etree.ElementTree as ET
@@ -39,8 +38,10 @@ jobs:
                   super().__init__()
                   self.parts = []
                   self.images = []
+
               def handle_data(self, data):
                   self.parts.append(data)
+
               def handle_starttag(self, tag, attrs):
                   if tag.lower() == "img":
                       src = dict(attrs).get("src")
@@ -50,30 +51,46 @@ jobs:
           def clean(value):
               parser = Extractor()
               parser.feed(value or "")
-              return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+              return re.sub(
+                  r"\s+", " ", " ".join(parser.parts)
+              ).strip()
 
           def translate(value):
               if not value:
                   return ""
               try:
                   params = urllib.parse.urlencode({
-                      "client": "gtx", "sl": "auto", "tl": "it",
-                      "dt": "t", "q": value[:1000]
+                      "client": "gtx",
+                      "sl": "auto",
+                      "tl": "it",
+                      "dt": "t",
+                      "q": value[:1000]
                   })
-                  url = "https://translate.googleapis.com/translate_a/single?" + params
-                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  url = (
+                      "https://translate.googleapis.com/"
+                      "translate_a/single?" + params
+                  )
+                  req = urllib.request.Request(
+                      url, headers={"User-Agent": "Mozilla/5.0"}
+                  )
                   with urllib.request.urlopen(req, timeout=15) as response:
                       data = json.loads(response.read().decode())
-                  return "".join(part[0] for part in data[0] if part[0])
+                  return "".join(
+                      part[0] for part in data[0] if part[0]
+                  )
               except Exception:
                   return value
 
           def get_image(item):
               for element in item.iter():
-                  if element.tag.endswith("}thumbnail") or element.tag.endswith("}content"):
+                  if (
+                      element.tag.endswith("}thumbnail")
+                      or element.tag.endswith("}content")
+                  ):
                       url = element.attrib.get("url")
                       if url and url.startswith("http"):
                           return url
+
                   if element.tag == "enclosure":
                       url = element.attrib.get("url")
                       if url and url.startswith("http"):
@@ -82,16 +99,24 @@ jobs:
               description = item.findtext("description", "")
               parser = Extractor()
               parser.feed(description)
+
               for url in parser.images:
                   if url.startswith("http"):
                       return url
+
               return None
 
           query = '"The Weeknd" OR "Abel Tesfaye" when:2d'
           params = urllib.parse.urlencode({
-              "q": query, "hl": "it", "gl": "IT", "ceid": "IT:it"
+              "q": query,
+              "hl": "it",
+              "gl": "IT",
+              "ceid": "IT:it"
           })
-          feed_url = "https://news.google.com/rss/search?" + params
+
+          feed_url = (
+              "https://news.google.com/rss/search?" + params
+          )
           req = urllib.request.Request(
               feed_url, headers={"User-Agent": "Mozilla/5.0"}
           )
@@ -111,9 +136,14 @@ jobs:
               link = item.findtext("link", "")
               pubdate = item.findtext("pubDate", "")
 
-              # Filtro rigoroso: deve essere citato l'artista.
-              searchable = (title + " " + description).casefold()
-              if "the weeknd" not in searchable and "abel tesfaye" not in searchable:
+              searchable = (
+                  title + " " + description
+              ).casefold()
+
+              if (
+                  "the weeknd" not in searchable
+                  and "abel tesfaye" not in searchable
+              ):
                   continue
 
               if not title or not link:
@@ -131,6 +161,7 @@ jobs:
               key = title.casefold()
               if key in seen:
                   continue
+
               seen.add(key)
 
               articles.append({
@@ -141,12 +172,11 @@ jobs:
                   "image": get_image(item)
               })
 
-          articles.sort(key=lambda a: a["date"], reverse=True)
+          articles.sort(
+              key=lambda article: article["date"],
+              reverse=True
+          )
           articles = articles[:5]
-
-          if not articles:
-              print("Nessuna notizia pertinente nelle ultime 48 ore.")
-              raise SystemExit(0)
 
           lines = [
               "📰 XO DAILY NEWS",
@@ -154,24 +184,39 @@ jobs:
               ""
           ]
 
-          for i, article in enumerate(articles, 1):
-              title_it = translate(article["title"])
-              summary = translate(article["description"][:500])
-              if not summary:
-                  summary = "Apri la fonte per leggere la notizia."
-              lines.append(f"{i}. {title_it}")
-              lines.append(summary[:230])
-              lines.append(article["link"])
-              lines.append("")
+          if articles:
+              for i, article in enumerate(articles, 1):
+                  title_it = translate(article["title"])
+                  summary = translate(
+                      article["description"][:500]
+                  )
+
+                  if not summary:
+                      summary = "Apri la fonte per leggere la notizia."
+
+                  lines.append(f"{i}. {title_it}")
+                  lines.append(summary[:230])
+                  lines.append(article["link"])
+                  lines.append("")
+          else:
+              lines.extend([
+                  "Nessuna nuova notizia pertinente nelle ultime 48 ore.",
+                  ""
+              ])
+
+          lines.extend([
+              "📸 INSTAGRAM",
+              "Profilo ufficiale: https://www.instagram.com/theweeknd/",
+              "Fanpage: https://www.instagram.com/abelspost/"
+          ])
 
           message = "\n".join(lines).strip()
 
           token = os.environ["BOT_TOKEN"]
           base = f"https://api.telegram.org/bot{token}/"
 
-          # Se è disponibile una foto per la prima notizia,
-          # la inserisce nello stesso messaggio come immagine.
-          image = articles[0]["image"]
+          # Le foto vengono usate solo se disponibili nel feed.
+          image = articles[0]["image"] if articles else None
 
           if image:
               payload = urllib.parse.urlencode({
@@ -190,12 +235,22 @@ jobs:
               }).encode()
               endpoint = base + "sendMessage"
 
-          request = urllib.request.Request(endpoint, data=payload)
-          with urllib.request.urlopen(request, timeout=30) as response:
+          request = urllib.request.Request(
+              endpoint, data=payload
+          )
+
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
               result = json.loads(response.read().decode())
 
           if not result.get("ok"):
-              raise RuntimeError("Telegram non ha accettato il messaggio.")
+              raise RuntimeError(
+                  "Telegram non ha accettato il messaggio."
+              )
 
-          print(f"Inviate {len(articles)} notizie pertinenti.")
+          print(
+              f"Pubblicazione completata. "
+              f"Notizie trovate: {len(articles)}"
+          )
           PY
