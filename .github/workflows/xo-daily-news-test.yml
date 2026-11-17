@@ -1,3 +1,4 @@
+
 name: XO Daily News - Test Google
 
 'on':
@@ -36,9 +37,9 @@ jobs:
           import urllib.parse as urlparse
           import json
           import re
-          import html
           import logging
           from datetime import datetime, timedelta, timezone
+          from difflib import SequenceMatcher
           from bs4 import BeautifulSoup
 
           logging.basicConfig(
@@ -48,18 +49,38 @@ jobs:
 
           NOW = datetime.now(timezone.utc)
           CUTOFF = NOW - timedelta(hours=24)
+          MAX_ARTICLES = 5
+          MAX_CANDIDATES = 30
 
           SESSION = requests.Session()
           SESSION.headers.update({
-              "User-Agent": "Mozilla/5.0"
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+              )
           })
 
           QUERIES = [
-              ("The Weeknd", "en-US", "US", "US:en"),
+              ('"The Weeknd"', "en-US", "US", "US:en"),
               ('"Abel Tesfaye"', "en-US", "US", "US:en"),
-              ("The Weeknd", "it", "IT", "IT:it"),
+              ('"The Weeknd"', "it", "IT", "IT:it"),
               ('"Abel Tesfaye"', "it", "IT", "IT:it"),
           ]
+
+          ARTIST_RE = re.compile(
+              r"\bthe\s+weeknd\b|\babel\s+tesfaye\b",
+              re.IGNORECASE
+          )
+
+          STOP_WORDS = {
+              "the", "and", "for", "with", "from", "that",
+              "this", "his", "her", "new", "about", "after",
+              "before", "weeknd", "abel", "tesfaye",
+              "una", "uno", "con", "per", "della", "delle",
+              "degli", "dallo", "dalla", "dalle", "del",
+              "nel", "nella", "sul", "sulla", "che",
+              "come", "sono", "sua", "suo", "their"
+          }
 
           def parse_date(value):
               if not value:
@@ -76,14 +97,13 @@ jobs:
           def resolve_google_url(link):
               try:
                   parts = urlparse.urlsplit(link)
+
                   if "news.google.com" not in parts.netloc:
                       return link
 
                   article_id = parts.path.rstrip("/").split("/")[-1]
 
-                  page = SESSION.get(
-                      link, timeout=25
-                  )
+                  page = SESSION.get(link, timeout=25)
                   page.raise_for_status()
 
                   match_sg = re.search(
@@ -127,8 +147,7 @@ jobs:
                   )
                   response.raise_for_status()
 
-                  raw = response.text
-                  raw = raw.split("\n\n", 1)[-1].strip()
+                  raw = response.text.split("\n\n", 1)[-1].strip()
 
                   if raw.startswith(")]}'"):
                       raw = raw[4:].strip()
@@ -155,9 +174,7 @@ jobs:
 
           def get_article_text(url):
               try:
-                  response = SESSION.get(
-                      url, timeout=20
-                  )
+                  response = SESSION.get(url, timeout=20)
                   response.raise_for_status()
 
                   soup = BeautifulSoup(
@@ -171,6 +188,7 @@ jobs:
                           data = json.loads(
                               script.string or script.get_text()
                           )
+
                           objects = (
                               data if isinstance(data, list)
                               else [data]
@@ -181,6 +199,7 @@ jobs:
                                   body = obj.get("articleBody")
                                   if body and len(body) > 100:
                                       return body
+
                       except Exception:
                           continue
 
@@ -199,9 +218,44 @@ jobs:
                   )
                   return ""
 
+          def title_tokens(title):
+              normalized = title.lower()
+              normalized = re.sub(
+                  r"the\s+weeknd|abel\s+tesfaye",
+                  " ",
+                  normalized
+              )
+              words = re.findall(r"[a-z0-9à-ÿ]+", normalized)
+
+              return {
+                  word for word in words
+                  if len(word) > 2 and word not in STOP_WORDS
+              }
+
+          def same_story(title_a, title_b):
+              a = title_tokens(title_a)
+              b = title_tokens(title_b)
+
+              if not a or not b:
+                  return False
+
+              common = a.intersection(b)
+
+              if len(common) >= 3:
+                  overlap = len(common) / min(len(a), len(b))
+                  if overlap >= 0.50:
+                      return True
+
+              ratio = SequenceMatcher(
+                  None,
+                  " ".join(sorted(a)),
+                  " ".join(sorted(b))
+              ).ratio()
+
+              return ratio >= 0.78
+
           def main():
               results = {}
-              total = 0
 
               for query, language, country, edition in QUERIES:
                   params = {
@@ -226,6 +280,7 @@ jobs:
                           feed_url, timeout=25
                       )
                       response.raise_for_status()
+
                       feed = feedparser.parse(response.content)
 
                       logging.info(
@@ -248,14 +303,12 @@ jobs:
 
                           key = title.lower()
 
-                          if key in results:
-                              continue
-
-                          results[key] = {
-                              "title": title,
-                              "date": published,
-                              "google_link": link
-                          }
+                          if key not in results:
+                              results[key] = {
+                                  "title": title,
+                                  "date": published,
+                                  "google_link": link
+                              }
 
                   except Exception as exc:
                       logging.error(
@@ -263,7 +316,7 @@ jobs:
                       )
 
               logging.info(
-                  "Totale articoli unici nelle ultime 24 ore: %s",
+                  "Risultati unici nelle ultime 24 ore: %s",
                   len(results)
               )
 
@@ -273,59 +326,106 @@ jobs:
                   reverse=True
               )
 
-              for item in ordered[:15]:
-                  total += 1
-                  logging.info("=" * 60)
-                  logging.info("ARTICOLO %s", total)
-                  logging.info("Titolo: %s", item["title"])
-                  logging.info(
-                      "Data: %s",
-                      item["date"].isoformat()
-                  )
+              selected = []
+              rejected_title = 0
+              rejected_text = 0
+              rejected_duplicate = 0
+              rejected_link = 0
+
+              for item in ordered[:MAX_CANDIDATES]:
+                  title = item["title"]
+
+                  logging.info("-" * 60)
+                  logging.info("Controllo: %s", title)
+
+                  if not ARTIST_RE.search(title):
+                      rejected_title += 1
+                      logging.info(
+                          "SCARTATO: il titolo non cita direttamente l'artista."
+                      )
+                      continue
 
                   original_url = resolve_google_url(
                       item["google_link"]
                   )
 
                   if not original_url:
-                      logging.warning(
-                          "LINK ORIGINALE NON RISOLTO"
+                      rejected_link += 1
+                      logging.info(
+                          "SCARTATO: link originale non risolto."
                       )
                       continue
 
-                  logging.info(
-                      "Link originale: %s", original_url
-                  )
-
                   text = get_article_text(original_url)
 
-                  if text:
-                      relevant = bool(
-                          re.search(
-                              r"the weeknd|abel tesfaye",
-                              text,
-                              re.IGNORECASE
-                          )
-                      )
+                  if not text:
+                      rejected_text += 1
                       logging.info(
-                          "Testo articolo recuperato: SÌ"
+                          "SCARTATO: testo dell'articolo non accessibile."
                       )
-                      logging.info(
-                          "Citazione di Abel nel testo: %s",
-                          "SÌ" if relevant else "NO"
-                      )
-                      logging.info(
-                          "Lunghezza testo: %s caratteri",
-                          len(text)
-                      )
-                  else:
-                      logging.warning(
-                          "TESTO ARTICOLO NON ACCESSIBILE"
-                      )
+                      continue
 
-              if total == 0:
+                  if not ARTIST_RE.search(text):
+                      rejected_text += 1
+                      logging.info(
+                          "SCARTATO: il testo non conferma il riferimento all'artista."
+                      )
+                      continue
+
+                  duplicate = next(
+                      (
+                          previous for previous in selected
+                          if same_story(
+                              title, previous["title"]
+                          )
+                      ),
+                      None
+                  )
+
+                  if duplicate:
+                      rejected_duplicate += 1
+                      logging.info(
+                          "SCARTATO: possibile duplicato di '%s'.",
+                          duplicate["title"]
+                      )
+                      continue
+
+                  selected.append({
+                      "title": title,
+                      "date": item["date"],
+                      "url": original_url,
+                      "text_length": len(text)
+                  })
+
+                  logging.info("SELEZIONATO")
+                  logging.info("Titolo: %s", title)
+                  logging.info("Data: %s", item["date"].isoformat())
+                  logging.info("Link originale: %s", original_url)
+                  logging.info("Testo recuperato: %s caratteri", len(text))
+
+                  if len(selected) >= MAX_ARTICLES:
+                      break
+
+              logging.info("=" * 60)
+              logging.info("RIEPILOGO DEL TEST")
+              logging.info("Articoli selezionati: %s", len(selected))
+              logging.info("Scartati per titolo non pertinente: %s", rejected_title)
+              logging.info("Scartati per testo non accessibile/non pertinente: %s", rejected_text)
+              logging.info("Scartati come duplicati: %s", rejected_duplicate)
+              logging.info("Scartati per link non risolto: %s", rejected_link)
+
+              if selected:
+                  logging.info("ARTICOLI FINALI:")
+                  for index, item in enumerate(selected, 1):
+                      logging.info(
+                          "%s. %s | %s",
+                          index,
+                          item["title"],
+                          item["url"]
+                      )
+              else:
                   logging.info(
-                      "Nessun risultato nelle ultime 24 ore."
+                      "Nessun articolo ha superato tutti i controlli."
                   )
 
               logging.info("=" * 60)
@@ -335,4 +435,3 @@ jobs:
 
           main()
           PY
-          
