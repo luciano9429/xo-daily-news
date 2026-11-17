@@ -1,0 +1,338 @@
+name: XO Daily News - Test Google
+
+'on':
+  schedule:
+    - cron: '15 9 * * *'
+      timezone: 'Europe/Rome'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xo-google-news-test
+  cancel-in-progress: false
+
+jobs:
+  test-google-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configura Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installa dipendenze
+        run: |
+          pip install requests feedparser beautifulsoup4
+
+      - name: Test ricerca Google News
+        run: |
+          python <<'PY'
+          import requests
+          import feedparser
+          import urllib.parse
+          import urllib.parse as urlparse
+          import json
+          import re
+          import html
+          import logging
+          from datetime import datetime, timedelta, timezone
+          from bs4 import BeautifulSoup
+
+          logging.basicConfig(
+              level=logging.INFO,
+              format="%(asctime)s %(levelname)s %(message)s"
+          )
+
+          NOW = datetime.now(timezone.utc)
+          CUTOFF = NOW - timedelta(hours=24)
+
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              "User-Agent": "Mozilla/5.0"
+          })
+
+          QUERIES = [
+              ("The Weeknd", "en-US", "US", "US:en"),
+              ('"Abel Tesfaye"', "en-US", "US", "US:en"),
+              ("The Weeknd", "it", "IT", "IT:it"),
+              ('"Abel Tesfaye"', "it", "IT", "IT:it"),
+          ]
+
+          def parse_date(value):
+              if not value:
+                  return None
+              try:
+                  from email.utils import parsedate_to_datetime
+                  dt = parsedate_to_datetime(value)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.astimezone(timezone.utc)
+              except Exception:
+                  return None
+
+          def resolve_google_url(link):
+              try:
+                  parts = urlparse.urlsplit(link)
+                  if "news.google.com" not in parts.netloc:
+                      return link
+
+                  article_id = parts.path.rstrip("/").split("/")[-1]
+
+                  page = SESSION.get(
+                      link, timeout=25
+                  )
+                  page.raise_for_status()
+
+                  match_sg = re.search(
+                      r'data-n-a-sg="([^"]+)"',
+                      page.text
+                  )
+                  match_ts = re.search(
+                      r'data-n-a-ts="([^"]+)"',
+                      page.text
+                  )
+
+                  if not match_sg or not match_ts:
+                      logging.warning(
+                          "Google non ha fornito i dati per risolvere il link."
+                      )
+                      return None
+
+                  sg = match_sg.group(1)
+                  ts = match_ts.group(1)
+
+                  inner = (
+                      '["garturlreq",[["X","X",["X","X"],null,null,1,1,'
+                      '"US:en",null,1,null,null,null,null,null,0,1],'
+                      '"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+                      f'"{article_id}",{ts},"{sg}"]'
+                  )
+
+                  payload = json.dumps(
+                      [[["Fbv4je", inner, None, "generic"]]]
+                  )
+
+                  response = SESSION.post(
+                      "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                      params={"rpcids": "Fbv4je"},
+                      data={"f.req": payload},
+                      headers={
+                          "Content-Type":
+                          "application/x-www-form-urlencoded;charset=UTF-8"
+                      },
+                      timeout=25
+                  )
+                  response.raise_for_status()
+
+                  raw = response.text
+                  raw = raw.split("\n\n", 1)[-1].strip()
+
+                  if raw.startswith(")]}'"):
+                      raw = raw[4:].strip()
+
+                  data = json.loads(raw)
+                  row = data[0][2]
+
+                  if not row:
+                      return None
+
+                  result = json.loads(row)
+                  real_url = result[1]
+
+                  if not real_url.startswith("https://"):
+                      return None
+
+                  return real_url
+
+              except Exception as exc:
+                  logging.warning(
+                      "Risoluzione link non riuscita: %s", exc
+                  )
+                  return None
+
+          def get_article_text(url):
+              try:
+                  response = SESSION.get(
+                      url, timeout=20
+                  )
+                  response.raise_for_status()
+
+                  soup = BeautifulSoup(
+                      response.text, "html.parser"
+                  )
+
+                  for script in soup.find_all(
+                      "script", type="application/ld+json"
+                  ):
+                      try:
+                          data = json.loads(
+                              script.string or script.get_text()
+                          )
+                          objects = (
+                              data if isinstance(data, list)
+                              else [data]
+                          )
+
+                          for obj in objects:
+                              if isinstance(obj, dict):
+                                  body = obj.get("articleBody")
+                                  if body and len(body) > 100:
+                                      return body
+                      except Exception:
+                          continue
+
+                  paragraphs = [
+                      p.get_text(" ", strip=True)
+                      for p in soup.find_all("p")
+                  ]
+
+                  return " ".join(
+                      p for p in paragraphs if len(p) > 40
+                  )
+
+              except Exception as exc:
+                  logging.warning(
+                      "Impossibile leggere l'articolo: %s", exc
+                  )
+                  return ""
+
+          def main():
+              results = {}
+              total = 0
+
+              for query, language, country, edition in QUERIES:
+                  params = {
+                      "q": query + " when:1d",
+                      "hl": language,
+                      "gl": country,
+                      "ceid": edition
+                  }
+
+                  feed_url = (
+                      "https://news.google.com/rss/search?"
+                      + urllib.parse.urlencode(params)
+                  )
+
+                  logging.info(
+                      "Ricerca Google News: %s (%s)",
+                      query, edition
+                  )
+
+                  try:
+                      response = SESSION.get(
+                          feed_url, timeout=25
+                      )
+                      response.raise_for_status()
+                      feed = feedparser.parse(response.content)
+
+                      logging.info(
+                          "Risultati RSS ricevuti: %s",
+                          len(feed.entries)
+                      )
+
+                      for entry in feed.entries:
+                          title = entry.get("title", "").strip()
+                          published = parse_date(
+                              entry.get("published")
+                          )
+                          link = entry.get("link", "")
+
+                          if not title or not link or not published:
+                              continue
+
+                          if published < CUTOFF or published > NOW:
+                              continue
+
+                          key = title.lower()
+
+                          if key in results:
+                              continue
+
+                          results[key] = {
+                              "title": title,
+                              "date": published,
+                              "google_link": link
+                          }
+
+                  except Exception as exc:
+                      logging.error(
+                          "Errore ricerca Google News: %s", exc
+                      )
+
+              logging.info(
+                  "Totale articoli unici nelle ultime 24 ore: %s",
+                  len(results)
+              )
+
+              ordered = sorted(
+                  results.values(),
+                  key=lambda x: x["date"],
+                  reverse=True
+              )
+
+              for item in ordered[:15]:
+                  total += 1
+                  logging.info("=" * 60)
+                  logging.info("ARTICOLO %s", total)
+                  logging.info("Titolo: %s", item["title"])
+                  logging.info(
+                      "Data: %s",
+                      item["date"].isoformat()
+                  )
+
+                  original_url = resolve_google_url(
+                      item["google_link"]
+                  )
+
+                  if not original_url:
+                      logging.warning(
+                          "LINK ORIGINALE NON RISOLTO"
+                      )
+                      continue
+
+                  logging.info(
+                      "Link originale: %s", original_url
+                  )
+
+                  text = get_article_text(original_url)
+
+                  if text:
+                      relevant = bool(
+                          re.search(
+                              r"the weeknd|abel tesfaye",
+                              text,
+                              re.IGNORECASE
+                          )
+                      )
+                      logging.info(
+                          "Testo articolo recuperato: SÌ"
+                      )
+                      logging.info(
+                          "Citazione di Abel nel testo: %s",
+                          "SÌ" if relevant else "NO"
+                      )
+                      logging.info(
+                          "Lunghezza testo: %s caratteri",
+                          len(text)
+                      )
+                  else:
+                      logging.warning(
+                          "TESTO ARTICOLO NON ACCESSIBILE"
+                      )
+
+              if total == 0:
+                  logging.info(
+                      "Nessun risultato nelle ultime 24 ore."
+                  )
+
+              logging.info("=" * 60)
+              logging.info(
+                  "TEST COMPLETATO. NESSUN MESSAGGIO TELEGRAM INVIATO."
+              )
+
+          main()
+          PY
+          
