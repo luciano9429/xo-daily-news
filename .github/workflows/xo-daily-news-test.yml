@@ -1,4 +1,3 @@
-
 name: XO Daily News - Test Google
 
 'on':
@@ -41,6 +40,7 @@ jobs:
           from datetime import datetime, timedelta, timezone
           from difflib import SequenceMatcher
           from bs4 import BeautifulSoup
+          from urllib.parse import urlparse as parse_url
 
           logging.basicConfig(
               level=logging.INFO,
@@ -79,18 +79,62 @@ jobs:
               "una", "uno", "con", "per", "della", "delle",
               "degli", "dallo", "dalla", "dalle", "del",
               "nel", "nella", "sul", "sulla", "che",
-              "come", "sono", "sua", "suo", "their"
+              "come", "sono", "sua", "suo", "their",
+              "has", "have", "had", "was", "were",
+              "its", "his", "her", "they", "them",
+              "video", "star", "starring"
           }
+
+          # Preferenza indicativa delle fonti.
+          # Un numero più basso indica una priorità maggiore.
+          SOURCE_PRIORITY = {
+              "complex.com": 1,
+              "billboard.com": 1,
+              "rollingstone.com": 1,
+              "pitchfork.com": 1,
+              "variety.com": 1,
+              "hollywoodreporter.com": 1,
+              "reuters.com": 1,
+              "apnews.com": 1,
+              "bbc.com": 1,
+              "bbc.co.uk": 1,
+              "theguardian.com": 1,
+              "nme.com": 2,
+              "people.com": 2,
+              "timesofindia.indiatimes.com": 2,
+              "trend yhiphop.com": 3,
+              "power98.com.sg": 3,
+              "footyheadlines.com": 4
+          }
+
+          def get_domain(url):
+              try:
+                  return parse_url(url).netloc.lower().replace("www.", "")
+              except Exception:
+                  return ""
+
+          def source_priority(url):
+              domain = get_domain(url)
+
+              for known_domain, priority in SOURCE_PRIORITY.items():
+                  if known_domain in domain:
+                      return priority
+
+              return 3
 
           def parse_date(value):
               if not value:
                   return None
+
               try:
                   from email.utils import parsedate_to_datetime
                   dt = parsedate_to_datetime(value)
+
                   if dt.tzinfo is None:
                       dt = dt.replace(tzinfo=timezone.utc)
+
                   return dt.astimezone(timezone.utc)
+
               except Exception:
                   return None
 
@@ -110,6 +154,7 @@ jobs:
                       r'data-n-a-sg="([^"]+)"',
                       page.text
                   )
+
                   match_ts = re.search(
                       r'data-n-a-ts="([^"]+)"',
                       page.text
@@ -145,6 +190,7 @@ jobs:
                       },
                       timeout=25
                   )
+
                   response.raise_for_status()
 
                   raw = response.text.split("\n\n", 1)[-1].strip()
@@ -197,6 +243,7 @@ jobs:
                           for obj in objects:
                               if isinstance(obj, dict):
                                   body = obj.get("articleBody")
+
                                   if body and len(body) > 100:
                                       return body
 
@@ -220,19 +267,60 @@ jobs:
 
           def title_tokens(title):
               normalized = title.lower()
+
               normalized = re.sub(
                   r"the\s+weeknd|abel\s+tesfaye",
                   " ",
                   normalized
               )
-              words = re.findall(r"[a-z0-9à-ÿ]+", normalized)
+
+              # Uniforma le diverse forme del nome PSG.
+              normalized = re.sub(
+                  r"paris[-\s]+saint[-\s]+germain",
+                  " psg ",
+                  normalized
+              )
+
+              words = re.findall(
+                  r"[a-z0-9à-ÿ]+",
+                  normalized
+              )
 
               return {
                   word for word in words
                   if len(word) > 2 and word not in STOP_WORDS
               }
 
+          def is_psg_xo_collection(title):
+              normalized = title.lower()
+
+              has_psg = bool(
+                  re.search(
+                      r"\bpsg\b|paris[-\s]+saint[-\s]+germain",
+                      normalized
+                  )
+              )
+
+              has_xo = bool(re.search(r"\bxo\b", normalized))
+
+              has_collection = bool(
+                  re.search(
+                      r"collection|collaboration|collab|lifestyle|"
+                      r"apparel|clothing|fashion",
+                      normalized
+                  )
+              )
+
+              return has_psg and has_xo and has_collection
+
           def same_story(title_a, title_b):
+              # Regola specifica per la collaborazione PSG–XO.
+              if (
+                  is_psg_xo_collection(title_a)
+                  and is_psg_xo_collection(title_b)
+              ):
+                  return True
+
               a = title_tokens(title_a)
               b = title_tokens(title_b)
 
@@ -243,7 +331,8 @@ jobs:
 
               if len(common) >= 3:
                   overlap = len(common) / min(len(a), len(b))
-                  if overlap >= 0.50:
+
+                  if overlap >= 0.60:
                       return True
 
               ratio = SequenceMatcher(
@@ -252,7 +341,16 @@ jobs:
                   " ".join(sorted(b))
               ).ratio()
 
-              return ratio >= 0.78
+              return ratio >= 0.82
+
+          def candidate_score(item):
+              # Prima la priorità della fonte, poi la data,
+              # infine la lunghezza del testo recuperato.
+              return (
+                  -source_priority(item["url"]),
+                  item["date"].timestamp(),
+                  item["text_length"]
+              )
 
           def main():
               results = {}
@@ -271,7 +369,7 @@ jobs:
                   )
 
                   logging.info(
-                      "Ricerca Google News: %s (%s)",
+                      'Ricerca Google News: %s (%s)',
                       query, edition
                   )
 
@@ -326,12 +424,15 @@ jobs:
                   reverse=True
               )
 
-              selected = []
+              candidates = []
+
               rejected_title = 0
               rejected_text = 0
-              rejected_duplicate = 0
               rejected_link = 0
+              rejected_duplicate = 0
 
+              # Esamina tutti i candidati, senza fermarsi
+              # appena ne trova cinque.
               for item in ordered[:MAX_CANDIDATES]:
                   title = item["title"]
 
@@ -372,11 +473,42 @@ jobs:
                       )
                       continue
 
+                  candidate = {
+                      "title": title,
+                      "date": item["date"],
+                      "url": original_url,
+                      "text_length": len(text),
+                      "domain": get_domain(original_url)
+                  }
+
+                  candidates.append(candidate)
+
+                  logging.info("CANDIDATO VALIDO")
+                  logging.info("Titolo: %s", title)
+                  logging.info("Fonte: %s", candidate["domain"])
+                  logging.info(
+                      "Priorità fonte: %s",
+                      source_priority(original_url)
+                  )
+
+              # Ordina i candidati in base alla priorità
+              # della fonte e poi alla data.
+              candidates.sort(
+                  key=candidate_score,
+                  reverse=True
+              )
+
+              # Deduplicazione dopo aver esaminato tutti
+              # gli articoli validi.
+              unique_candidates = []
+
+              for candidate in candidates:
                   duplicate = next(
                       (
-                          previous for previous in selected
+                          previous for previous in unique_candidates
                           if same_story(
-                              title, previous["title"]
+                              candidate["title"],
+                              previous["title"]
                           )
                       ),
                       None
@@ -384,43 +516,59 @@ jobs:
 
                   if duplicate:
                       rejected_duplicate += 1
+
                       logging.info(
-                          "SCARTATO: possibile duplicato di '%s'.",
+                          "DUPLICATO: '%s' viene accorpato a '%s'.",
+                          candidate["title"],
                           duplicate["title"]
                       )
                       continue
 
-                  selected.append({
-                      "title": title,
-                      "date": item["date"],
-                      "url": original_url,
-                      "text_length": len(text)
-                  })
+                  unique_candidates.append(candidate)
 
-                  logging.info("SELEZIONATO")
-                  logging.info("Titolo: %s", title)
-                  logging.info("Data: %s", item["date"].isoformat())
-                  logging.info("Link originale: %s", original_url)
-                  logging.info("Testo recuperato: %s caratteri", len(text))
-
-                  if len(selected) >= MAX_ARTICLES:
-                      break
+              # I migliori cinque articoli dopo la deduplicazione.
+              selected = unique_candidates[:MAX_ARTICLES]
 
               logging.info("=" * 60)
               logging.info("RIEPILOGO DEL TEST")
-              logging.info("Articoli selezionati: %s", len(selected))
-              logging.info("Scartati per titolo non pertinente: %s", rejected_title)
-              logging.info("Scartati per testo non accessibile/non pertinente: %s", rejected_text)
-              logging.info("Scartati come duplicati: %s", rejected_duplicate)
-              logging.info("Scartati per link non risolto: %s", rejected_link)
+              logging.info(
+                  "Candidati validi esaminati: %s",
+                  len(candidates)
+              )
+              logging.info(
+                  "Articoli unici dopo deduplicazione: %s",
+                  len(unique_candidates)
+              )
+              logging.info(
+                  "Articoli finali selezionati: %s",
+                  len(selected)
+              )
+              logging.info(
+                  "Scartati per titolo non pertinente: %s",
+                  rejected_title
+              )
+              logging.info(
+                  "Scartati per testo non accessibile/non pertinente: %s",
+                  rejected_text
+              )
+              logging.info(
+                  "Scartati come duplicati: %s",
+                  rejected_duplicate
+              )
+              logging.info(
+                  "Scartati per link non risolto: %s",
+                  rejected_link
+              )
 
               if selected:
                   logging.info("ARTICOLI FINALI:")
+
                   for index, item in enumerate(selected, 1):
                       logging.info(
-                          "%s. %s | %s",
+                          "%s. %s | Fonte: %s | %s",
                           index,
                           item["title"],
+                          item["domain"],
                           item["url"]
                       )
               else:
