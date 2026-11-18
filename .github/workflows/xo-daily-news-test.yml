@@ -81,8 +81,8 @@ jobs:
               "nel", "nella", "sul", "sulla", "che",
               "come", "sono", "sua", "suo", "their",
               "has", "have", "had", "was", "were",
-              "its", "his", "her", "they", "them",
-              "video", "star", "starring"
+              "its", "they", "them", "video", "star",
+              "starring"
           }
 
           # Preferenza indicativa delle fonti.
@@ -102,7 +102,7 @@ jobs:
               "nme.com": 2,
               "people.com": 2,
               "timesofindia.indiatimes.com": 2,
-              "trend yhiphop.com": 3,
+              "trendyhiphop.com": 3,
               "power98.com.sg": 3,
               "footyheadlines.com": 4
           }
@@ -136,7 +136,122 @@ jobs:
                   return dt.astimezone(timezone.utc)
 
               except Exception:
+                  pass
+
+              try:
+                  cleaned = str(value).strip()
+                  cleaned = cleaned.replace("Z", "+00:00")
+
+                  dt = datetime.fromisoformat(cleaned)
+
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+
+                  return dt.astimezone(timezone.utc)
+
+              except Exception:
+                  pass
+
+              for fmt in (
+                  "%Y-%m-%d",
+                  "%Y/%m/%d",
+                  "%d/%m/%Y",
+                  "%B %d, %Y",
+                  "%b %d, %Y"
+              ):
+                  try:
+                      dt = datetime.strptime(str(value).strip(), fmt)
+                      return dt.replace(tzinfo=timezone.utc)
+                  except Exception:
+                      continue
+
+              return None
+
+          def extract_jsonld_dates(data):
+              dates = []
+
+              if isinstance(data, list):
+                  for item in data:
+                      dates.extend(extract_jsonld_dates(item))
+
+              elif isinstance(data, dict):
+                  for key in ("datePublished", "dateCreated"):
+                      value = data.get(key)
+
+                      if isinstance(value, str):
+                          parsed = parse_date(value)
+
+                          if parsed:
+                              dates.append(parsed)
+
+                  graph = data.get("@graph")
+
+                  if graph:
+                      dates.extend(extract_jsonld_dates(graph))
+
+              return dates
+
+          def extract_original_publication_date(soup):
+              dates = []
+
+              # 1. JSON-LD: datePublished e dateCreated.
+              for script in soup.find_all(
+                  "script", type="application/ld+json"
+              ):
+                  try:
+                      data = json.loads(
+                          script.string or script.get_text()
+                      )
+                      dates.extend(extract_jsonld_dates(data))
+                  except Exception:
+                      continue
+
+              # 2. Metadati HTML comuni.
+              date_attributes = [
+                  ("property", "article:published_time"),
+                  ("property", "og:published_time"),
+                  ("name", "datePublished"),
+                  ("name", "date"),
+                  ("name", "pubdate"),
+                  ("name", "publishdate"),
+                  ("name", "publication_date"),
+                  ("name", "parsely-pub-date"),
+                  ("name", "sailthru.date"),
+                  ("itemprop", "datePublished"),
+              ]
+
+              for attribute, expected in date_attributes:
+                  tag = soup.find(
+                      "meta",
+                      attrs={attribute: expected}
+                  )
+
+                  if tag:
+                      value = tag.get("content")
+
+                      if value:
+                          parsed = parse_date(value)
+
+                          if parsed:
+                              dates.append(parsed)
+
+              # 3. Tag time con attributo datetime.
+              for tag in soup.find_all("time"):
+                  value = tag.get("datetime")
+
+                  if value:
+                      parsed = parse_date(value)
+
+                      if parsed:
+                          dates.append(parsed)
+
+              if not dates:
                   return None
+
+              # Per evitare di accettare aggiornamenti recenti
+              # di articoli vecchi, utilizziamo la data più antica
+              # tra quelle che identificano la pubblicazione.
+              return min(dates)
 
           def resolve_google_url(link):
               try:
@@ -218,7 +333,7 @@ jobs:
                   )
                   return None
 
-          def get_article_text(url):
+          def get_article_data(url):
               try:
                   response = SESSION.get(url, timeout=20)
                   response.raise_for_status()
@@ -226,6 +341,14 @@ jobs:
                   soup = BeautifulSoup(
                       response.text, "html.parser"
                   )
+
+                  # Recupera la data effettiva dalla pagina originale.
+                  publication_date = extract_original_publication_date(
+                      soup
+                  )
+
+                  # Recupera il testo dell'articolo.
+                  article_text = ""
 
                   for script in soup.find_all(
                       "script", type="application/ld+json"
@@ -245,25 +368,32 @@ jobs:
                                   body = obj.get("articleBody")
 
                                   if body and len(body) > 100:
-                                      return body
+                                      article_text = body
+                                      break
+
+                          if article_text:
+                              break
 
                       except Exception:
                           continue
 
-                  paragraphs = [
-                      p.get_text(" ", strip=True)
-                      for p in soup.find_all("p")
-                  ]
+                  if not article_text:
+                      paragraphs = [
+                          p.get_text(" ", strip=True)
+                          for p in soup.find_all("p")
+                      ]
 
-                  return " ".join(
-                      p for p in paragraphs if len(p) > 40
-                  )
+                      article_text = " ".join(
+                          p for p in paragraphs if len(p) > 40
+                      )
+
+                  return article_text, publication_date
 
               except Exception as exc:
                   logging.warning(
                       "Impossibile leggere l'articolo: %s", exc
                   )
-                  return ""
+                  return "", None
 
           def title_tokens(title):
               normalized = title.lower()
@@ -274,7 +404,6 @@ jobs:
                   normalized
               )
 
-              # Uniforma le diverse forme del nome PSG.
               normalized = re.sub(
                   r"paris[-\s]+saint[-\s]+germain",
                   " psg ",
@@ -314,7 +443,6 @@ jobs:
               return has_psg and has_xo and has_collection
 
           def same_story(title_a, title_b):
-              # Regola specifica per la collaborazione PSG–XO.
               if (
                   is_psg_xo_collection(title_a)
                   and is_psg_xo_collection(title_b)
@@ -344,8 +472,6 @@ jobs:
               return ratio >= 0.82
 
           def candidate_score(item):
-              # Prima la priorità della fonte, poi la data,
-              # infine la lunghezza del testo recuperato.
               return (
                   -source_priority(item["url"]),
                   item["date"].timestamp(),
@@ -430,9 +556,9 @@ jobs:
               rejected_text = 0
               rejected_link = 0
               rejected_duplicate = 0
+              rejected_old_date = 0
+              rejected_unknown_date = 0
 
-              # Esamina tutti i candidati, senza fermarsi
-              # appena ne trova cinque.
               for item in ordered[:MAX_CANDIDATES]:
                   title = item["title"]
 
@@ -457,7 +583,9 @@ jobs:
                       )
                       continue
 
-                  text = get_article_text(original_url)
+                  text, original_date = get_article_data(
+                      original_url
+                  )
 
                   if not text:
                       rejected_text += 1
@@ -473,9 +601,36 @@ jobs:
                       )
                       continue
 
+                  # Controllo della data effettiva dell'articolo.
+                  if not original_date:
+                      rejected_unknown_date += 1
+                      logging.info(
+                          "SCARTATO: data originale di pubblicazione non verificabile."
+                      )
+                      continue
+
+                  logging.info(
+                      "Data originale articolo: %s",
+                      original_date.isoformat()
+                  )
+
+                  if original_date < CUTOFF:
+                      rejected_old_date += 1
+                      logging.info(
+                          "SCARTATO: articolo pubblicato oltre 24 ore fa."
+                      )
+                      continue
+
+                  if original_date > NOW + timedelta(hours=1):
+                      rejected_old_date += 1
+                      logging.info(
+                          "SCARTATO: data di pubblicazione futura non valida."
+                      )
+                      continue
+
                   candidate = {
                       "title": title,
-                      "date": item["date"],
+                      "date": original_date,
                       "url": original_url,
                       "text_length": len(text),
                       "domain": get_domain(original_url)
@@ -491,15 +646,11 @@ jobs:
                       source_priority(original_url)
                   )
 
-              # Ordina i candidati in base alla priorità
-              # della fonte e poi alla data.
               candidates.sort(
                   key=candidate_score,
                   reverse=True
               )
 
-              # Deduplicazione dopo aver esaminato tutti
-              # gli articoli validi.
               unique_candidates = []
 
               for candidate in candidates:
@@ -526,7 +677,6 @@ jobs:
 
                   unique_candidates.append(candidate)
 
-              # I migliori cinque articoli dopo la deduplicazione.
               selected = unique_candidates[:MAX_ARTICLES]
 
               logging.info("=" * 60)
@@ -559,16 +709,25 @@ jobs:
                   "Scartati per link non risolto: %s",
                   rejected_link
               )
+              logging.info(
+                  "Scartati per data originale troppo vecchia/futura: %s",
+                  rejected_old_date
+              )
+              logging.info(
+                  "Scartati per data originale non verificabile: %s",
+                  rejected_unknown_date
+              )
 
               if selected:
                   logging.info("ARTICOLI FINALI:")
 
                   for index, item in enumerate(selected, 1):
                       logging.info(
-                          "%s. %s | Fonte: %s | %s",
+                          "%s. %s | Fonte: %s | Data: %s | %s",
                           index,
                           item["title"],
                           item["domain"],
+                          item["date"].isoformat(),
                           item["url"]
                       )
               else:
