@@ -60,11 +60,42 @@ jobs:
               )
           })
 
+          # Ricerca ampliata e suddivisa per argomento.
+          # Ogni argomento viene cercato sia negli USA
+          # sia nell'edizione italiana di Google News.
           QUERIES = [
-              ('"The Weeknd"', "en-US", "US", "US:en"),
-              ('"Abel Tesfaye"', "en-US", "US", "US:en"),
-              ('"The Weeknd"', "it", "IT", "IT:it"),
-              ('"Abel Tesfaye"', "it", "IT", "IT:it"),
+              (
+                  '"The Weeknd" (music OR album OR single OR soundtrack OR collaboration)',
+                  "en-US", "US", "US:en"
+              ),
+              (
+                  '"Abel Tesfaye" (film OR movie OR television OR series OR acting)',
+                  "en-US", "US", "US:en"
+              ),
+              (
+                  '"The Weeknd" (XO OR collaboration OR brand OR collection OR partnership)',
+                  "en-US", "US", "US:en"
+              ),
+              (
+                  '"The Weeknd" (tour OR concert OR live OR performance OR appearance)',
+                  "en-US", "US", "US:en"
+              ),
+              (
+                  '"The Weeknd" (musica OR album OR singolo OR colonna sonora OR collaborazione)',
+                  "it", "IT", "IT:it"
+              ),
+              (
+                  '"Abel Tesfaye" (film OR cinema OR serie OR televisione OR recitazione)',
+                  "it", "IT", "IT:it"
+              ),
+              (
+                  '"The Weeknd" (XO OR collaborazione OR marchio OR collezione)',
+                  "it", "IT", "IT:it"
+              ),
+              (
+                  '"The Weeknd" (tour OR concerto OR esibizione OR apparizione)',
+                  "it", "IT", "IT:it"
+              ),
           ]
 
           ARTIST_RE = re.compile(
@@ -129,8 +160,6 @@ jobs:
 
               try:
                   cleaned = str(value).strip()
-
-                  # Prima prova il formato ISO 8601.
                   cleaned_iso = cleaned.replace("Z", "+00:00")
                   dt = datetime.fromisoformat(cleaned_iso)
 
@@ -250,8 +279,6 @@ jobs:
               if not dates:
                   return None
 
-              # Per evitare di accettare aggiornamenti recenti
-              # di articoli vecchi, utilizziamo la data più antica.
               return min(dates)
 
           def resolve_google_url(link):
@@ -409,7 +436,6 @@ jobs:
                   normalized
               )
 
-              # Uniforma GTA VI e Grand Theft Auto VI.
               normalized = re.sub(
                   r"grand\s+theft\s+auto\s+(?:vi|6)",
                   " gta ",
@@ -470,7 +496,6 @@ jobs:
           def is_song_page(title):
               normalized = title.lower()
 
-              # Esempio: "The Weeknd – One Of The Girls ft..."
               track_listing = bool(
                   re.search(
                       r"the\s+weeknd\s*[–—-].{1,100}"
@@ -523,7 +548,6 @@ jobs:
               return None
 
           def same_story(title_a, title_b):
-              # Raggruppamento specifico della notizia GTA VI / Justice.
               if (
                   is_gta_justice_story(title_a)
                   and is_gta_justice_story(title_b)
@@ -582,7 +606,7 @@ jobs:
                   )
 
                   logging.info(
-                      'Ricerca Google News: %s (%s)',
+                      "Ricerca Google News: %s (%s)",
                       query, edition
                   )
 
@@ -719,8 +743,6 @@ jobs:
                       )
                       continue
 
-                  # Nessuna tolleranza: la data non può essere
-                  # successiva all'ora effettiva di esecuzione.
                   if original_date > NOW:
                       rejected_future_date += 1
                       logging.info(
@@ -746,8 +768,6 @@ jobs:
                       source_priority(original_url)
                   )
 
-              # Prima ordina per autorevolezza della fonte,
-              # poi per data e lunghezza del testo.
               candidates.sort(
                   key=candidate_score,
                   reverse=True
