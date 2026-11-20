@@ -1,3 +1,4 @@
+
 name: XO Daily News - Test Google
 
 'on':
@@ -82,7 +83,8 @@ jobs:
               "come", "sono", "sua", "suo", "their",
               "has", "have", "had", "was", "were",
               "its", "they", "them", "video", "star",
-              "starring"
+              "starring", "team", "teams", "features",
+              "featuring", "unreleased"
           }
 
           # Preferenza indicativa delle fonti.
@@ -117,7 +119,7 @@ jobs:
               domain = get_domain(url)
 
               for known_domain, priority in SOURCE_PRIORITY.items():
-                  if known_domain in domain:
+                  if domain == known_domain or domain.endswith("." + known_domain):
                       return priority
 
               return 3
@@ -127,8 +129,11 @@ jobs:
                   return None
 
               try:
-                  from email.utils import parsedate_to_datetime
-                  dt = parsedate_to_datetime(value)
+                  cleaned = str(value).strip()
+
+                  # Prima prova il formato ISO 8601.
+                  cleaned_iso = cleaned.replace("Z", "+00:00")
+                  dt = datetime.fromisoformat(cleaned_iso)
 
                   if dt.tzinfo is None:
                       dt = dt.replace(tzinfo=timezone.utc)
@@ -139,10 +144,8 @@ jobs:
                   pass
 
               try:
-                  cleaned = str(value).strip()
-                  cleaned = cleaned.replace("Z", "+00:00")
-
-                  dt = datetime.fromisoformat(cleaned)
+                  from email.utils import parsedate_to_datetime
+                  dt = parsedate_to_datetime(value)
 
                   if dt.tzinfo is None:
                       dt = dt.replace(tzinfo=timezone.utc)
@@ -249,8 +252,7 @@ jobs:
                   return None
 
               # Per evitare di accettare aggiornamenti recenti
-              # di articoli vecchi, utilizziamo la data più antica
-              # tra quelle che identificano la pubblicazione.
+              # di articoli vecchi, utilizziamo la data più antica.
               return min(dates)
 
           def resolve_google_url(link):
@@ -342,12 +344,10 @@ jobs:
                       response.text, "html.parser"
                   )
 
-                  # Recupera la data effettiva dalla pagina originale.
                   publication_date = extract_original_publication_date(
                       soup
                   )
 
-                  # Recupera il testo dell'articolo.
                   article_text = ""
 
                   for script in soup.find_all(
@@ -410,6 +410,13 @@ jobs:
                   normalized
               )
 
+              # Uniforma GTA VI e Grand Theft Auto VI.
+              normalized = re.sub(
+                  r"grand\s+theft\s+auto\s+(?:vi|6)",
+                  " gta ",
+                  normalized
+              )
+
               words = re.findall(
                   r"[a-z0-9à-ÿ]+",
                   normalized
@@ -442,7 +449,88 @@ jobs:
 
               return has_psg and has_xo and has_collection
 
+          def is_gta_justice_story(title):
+              normalized = title.lower()
+
+              has_gta = bool(
+                  re.search(
+                      r"\bgta\s*(?:vi|6)\b|"
+                      r"\bgrand\s+theft\s+auto\s+(?:vi|6)\b",
+                      normalized
+                  )
+              )
+
+              has_justice = bool(
+                  re.search(r"\bjustice\b", normalized)
+              )
+
+              has_weeknd = bool(ARTIST_RE.search(title))
+
+              return has_gta and has_justice and has_weeknd
+
+          def is_song_page(title):
+              normalized = title.lower()
+
+              # Esempio: "The Weeknd – One Of The Girls ft..."
+              track_listing = bool(
+                  re.search(
+                      r"the\s+weeknd\s*[–—-].{1,100}"
+                      r"\b(?:ft\.?|feat\.?|featuring)\b",
+                      normalized
+                  )
+              )
+
+              page_markers = bool(
+                  re.search(
+                      r"\b(song lyrics|lyrics|official audio|"
+                      r"official video|music video|mp3 download|"
+                      r"download mp3|listen to|tracklist)\b",
+                      normalized
+                  )
+              )
+
+              return track_listing or page_markers
+
+          def is_evergreen_content(title):
+              normalized = title.lower()
+
+              evergreen_patterns = [
+                  r"\bwatch collection\b",
+                  r"\bunconventional watch\b",
+                  r"\bstyle guide\b",
+                  r"\bfashion guide\b",
+                  r"\bwardrobe\b",
+                  r"\bmenswear\b",
+                  r"\bmen's jewelry\b",
+                  r"\bjewelry collection\b",
+                  r"\btop \d+",
+                  r"\bbest of\b",
+                  r"\beverything you need to know\b",
+                  r"\bcomplete guide\b",
+              ]
+
+              return any(
+                  re.search(pattern, normalized)
+                  for pattern in evergreen_patterns
+              )
+
+          def is_low_value_content(title):
+              if is_song_page(title):
+                  return "pagina musicale o scheda di una canzone"
+
+              if is_evergreen_content(title):
+                  return "contenuto evergreen, guida o approfondimento non attuale"
+
+              return None
+
           def same_story(title_a, title_b):
+              # Raggruppamento specifico della notizia GTA VI / Justice.
+              if (
+                  is_gta_justice_story(title_a)
+                  and is_gta_justice_story(title_b)
+              ):
+                  return True
+
               if (
                   is_psg_xo_collection(title_a)
                   and is_psg_xo_collection(title_b)
@@ -557,7 +645,9 @@ jobs:
               rejected_link = 0
               rejected_duplicate = 0
               rejected_old_date = 0
+              rejected_future_date = 0
               rejected_unknown_date = 0
+              rejected_evergreen = 0
 
               for item in ordered[:MAX_CANDIDATES]:
                   title = item["title"]
@@ -569,6 +659,16 @@ jobs:
                       rejected_title += 1
                       logging.info(
                           "SCARTATO: il titolo non cita direttamente l'artista."
+                      )
+                      continue
+
+                  low_value_reason = is_low_value_content(title)
+
+                  if low_value_reason:
+                      rejected_evergreen += 1
+                      logging.info(
+                          "SCARTATO: %s.",
+                          low_value_reason
                       )
                       continue
 
@@ -601,7 +701,6 @@ jobs:
                       )
                       continue
 
-                  # Controllo della data effettiva dell'articolo.
                   if not original_date:
                       rejected_unknown_date += 1
                       logging.info(
@@ -621,10 +720,12 @@ jobs:
                       )
                       continue
 
-                  if original_date > NOW + timedelta(hours=1):
-                      rejected_old_date += 1
+                  # Nessuna tolleranza: la data non può essere
+                  # successiva all'ora effettiva di esecuzione.
+                  if original_date > NOW:
+                      rejected_future_date += 1
                       logging.info(
-                          "SCARTATO: data di pubblicazione futura non valida."
+                          "SCARTATO: data originale successiva all'esecuzione."
                       )
                       continue
 
@@ -646,6 +747,8 @@ jobs:
                       source_priority(original_url)
                   )
 
+              # Prima ordina per autorevolezza della fonte,
+              # poi per data e lunghezza del testo.
               candidates.sort(
                   key=candidate_score,
                   reverse=True
@@ -710,12 +813,20 @@ jobs:
                   rejected_link
               )
               logging.info(
-                  "Scartati per data originale troppo vecchia/futura: %s",
+                  "Scartati per data originale troppo vecchia: %s",
                   rejected_old_date
+              )
+              logging.info(
+                  "Scartati per data originale futura: %s",
+                  rejected_future_date
               )
               logging.info(
                   "Scartati per data originale non verificabile: %s",
                   rejected_unknown_date
+              )
+              logging.info(
+                  "Scartati come evergreen o pagine musicali: %s",
+                  rejected_evergreen
               )
 
               if selected:
