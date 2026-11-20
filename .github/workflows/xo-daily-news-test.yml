@@ -1,3 +1,4 @@
+
 name: XO Daily News - Test Google
 
 'on':
@@ -50,7 +51,7 @@ jobs:
           NOW = datetime.now(timezone.utc)
           CUTOFF = NOW - timedelta(hours=24)
           MAX_ARTICLES = 5
-          MAX_CANDIDATES = 30
+          MAX_CANDIDATES = 50
 
           SESSION = requests.Session()
           SESSION.headers.update({
@@ -60,42 +61,17 @@ jobs:
               )
           })
 
-          # Ricerca ampliata e suddivisa per argomento.
-          # Ogni argomento viene cercato sia negli USA
-          # sia nell'edizione italiana di Google News.
+          # Ricerche ampie, senza vincoli tematici.
+          # USA, Regno Unito, Canada e Italia.
           QUERIES = [
-              (
-                  '"The Weeknd" (music OR album OR single OR soundtrack OR collaboration)',
-                  "en-US", "US", "US:en"
-              ),
-              (
-                  '"Abel Tesfaye" (film OR movie OR television OR series OR acting)',
-                  "en-US", "US", "US:en"
-              ),
-              (
-                  '"The Weeknd" (XO OR collaboration OR brand OR collection OR partnership)',
-                  "en-US", "US", "US:en"
-              ),
-              (
-                  '"The Weeknd" (tour OR concert OR live OR performance OR appearance)',
-                  "en-US", "US", "US:en"
-              ),
-              (
-                  '"The Weeknd" (musica OR album OR singolo OR colonna sonora OR collaborazione)',
-                  "it", "IT", "IT:it"
-              ),
-              (
-                  '"Abel Tesfaye" (film OR cinema OR serie OR televisione OR recitazione)',
-                  "it", "IT", "IT:it"
-              ),
-              (
-                  '"The Weeknd" (XO OR collaborazione OR marchio OR collezione)',
-                  "it", "IT", "IT:it"
-              ),
-              (
-                  '"The Weeknd" (tour OR concerto OR esibizione OR apparizione)',
-                  "it", "IT", "IT:it"
-              ),
+              ('"The Weeknd"', "en-US", "US", "US:en"),
+              ('"Abel Tesfaye"', "en-US", "US", "US:en"),
+              ('"The Weeknd"', "en-GB", "GB", "GB:en"),
+              ('"Abel Tesfaye"', "en-GB", "GB", "GB:en"),
+              ('"The Weeknd"', "en-CA", "CA", "CA:en"),
+              ('"Abel Tesfaye"', "en-CA", "CA", "CA:en"),
+              ('"The Weeknd"', "it", "IT", "IT:it"),
+              ('"Abel Tesfaye"', "it", "IT", "IT:it"),
           ]
 
           ARTIST_RE = re.compile(
@@ -117,8 +93,6 @@ jobs:
               "featuring", "unreleased"
           }
 
-          # Preferenza indicativa delle fonti.
-          # Un numero più basso indica una priorità maggiore.
           SOURCE_PRIORITY = {
               "complex.com": 1,
               "billboard.com": 1,
@@ -225,7 +199,6 @@ jobs:
           def extract_original_publication_date(soup):
               dates = []
 
-              # 1. JSON-LD: datePublished e dateCreated.
               for script in soup.find_all(
                   "script", type="application/ld+json"
               ):
@@ -237,7 +210,6 @@ jobs:
                   except Exception:
                       continue
 
-              # 2. Metadati HTML comuni.
               date_attributes = [
                   ("property", "article:published_time"),
                   ("property", "og:published_time"),
@@ -266,7 +238,6 @@ jobs:
                           if parsed:
                               dates.append(parsed)
 
-              # 3. Tag time con attributo datetime.
               for tag in soup.find_all("time"):
                   value = tag.get("datetime")
 
