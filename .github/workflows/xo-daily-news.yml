@@ -47,11 +47,14 @@ jobs:
           import re
           import json
           import html
-          import hashlib
+          import time
           import logging
-          from datetime import datetime, timedelta, timezone
-          from urllib.parse import urlsplit, urlunsplit, parse_qs
+          import urllib.parse
           from pathlib import Path
+          from datetime import datetime, timedelta, timezone
+          from difflib import SequenceMatcher
+          from email.utils import parsedate_to_datetime
+          from urllib.parse import urlparse as parse_url, urlsplit, urlunsplit, parse_qs
 
           import requests
           import feedparser
@@ -67,25 +70,26 @@ jobs:
           CHAT_ID = "-1004476534522"
           THREAD_ID = 40
 
+          NOW = datetime.now(timezone.utc)
+          CUTOFF = NOW - timedelta(hours=24)
+          VIDEO_CUTOFF = NOW - timedelta(days=7)
+          MAX_ARTICLES = 5
+          MAX_CANDIDATES = 50
+          MAX_HTTP_ATTEMPTS = 4
+          MAX_TELEGRAM_LENGTH = 3900
+
           STATE_DIR = Path(".xo_state")
           STATE_FILE = STATE_DIR / "seen.json"
           STATE_DIR.mkdir(exist_ok=True)
-
-          NOW = datetime.now(timezone.utc)
-          NEWS_CUTOFF = NOW - timedelta(hours=24)
-          VIDEO_CUTOFF = NOW - timedelta(days=7)
           FIRST_RUN = not STATE_FILE.exists()
 
           SESSION = requests.Session()
           SESSION.headers.update({
-              "User-Agent": "Mozilla/5.0 (compatible; XODailyNews/1.0)"
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+              )
           })
-
-          RSS_FEEDS = [
-              "https://pitchfork.com/feed/feed-news/rss",
-              "https://www.billboard.com/feed/",
-              "https://www.rollingstone.com/music/music-news/feed/",
-          ]
 
           OFFICIAL_YOUTUBE_RSS = (
               "https://www.youtube.com/feeds/videos.xml"
@@ -94,8 +98,56 @@ jobs:
 
           INSTAGRAM_LINKS = [
               ("The Weeknd", "https://www.instagram.com/theweeknd/"),
-              ("Abel's Post", "https://www.instagram.com/abelspost/"),
+              ("Abel's Post", "https://www.instagram.com/abelspost/")
           ]
+
+          QUERIES = [
+              ('"The Weeknd"', "en-US", "US", "US:en"),
+              ('"Abel Tesfaye"', "en-US", "US", "US:en"),
+              ('"The Weeknd"', "en-GB", "GB", "GB:en"),
+              ('"Abel Tesfaye"', "en-GB", "GB", "GB:en"),
+              ('"The Weeknd"', "en-CA", "CA", "CA:en"),
+              ('"Abel Tesfaye"', "en-CA", "CA", "CA:en"),
+              ('"The Weeknd"', "it", "IT", "IT:it"),
+              ('"Abel Tesfaye"', "it", "IT", "IT:it")
+          ]
+
+          ARTIST_RE = re.compile(
+              r"\bthe\s+weeknd\b|\babel\s+tesfaye\b",
+              re.IGNORECASE
+          )
+
+          STOP_WORDS = {
+              "the", "and", "for", "with", "from", "that", "this",
+              "his", "her", "new", "about", "after", "before",
+              "weeknd", "abel", "tesfaye", "una", "uno", "con",
+              "per", "della", "delle", "degli", "dallo", "dalla",
+              "dalle", "del", "nel", "nella", "sul", "sulla",
+              "che", "come", "sono", "sua", "suo", "their",
+              "has", "have", "had", "was", "were", "its", "they",
+              "them", "video", "star", "starring", "team", "teams",
+              "features", "featuring", "unreleased"
+          }
+
+          SOURCE_PRIORITY = {
+              "complex.com": 1,
+              "billboard.com": 1,
+              "rollingstone.com": 1,
+              "pitchfork.com": 1,
+              "variety.com": 1,
+              "hollywoodreporter.com": 1,
+              "reuters.com": 1,
+              "apnews.com": 1,
+              "bbc.com": 1,
+              "bbc.co.uk": 1,
+              "theguardian.com": 1,
+              "nme.com": 2,
+              "people.com": 2,
+              "timesofindia.indiatimes.com": 2,
+              "trendyhiphop.com": 3,
+              "power98.com.sg": 3,
+              "footyheadlines.com": 4
+          }
 
           def load_state():
               if not STATE_FILE.exists():
@@ -132,24 +184,73 @@ jobs:
                   encoding="utf-8"
               )
 
+          def request_with_retry(method, url, **kwargs):
+              for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+                  response = method(url, **kwargs)
+                  if response.status_code != 429:
+                      return response
+                  if attempt == MAX_HTTP_ATTEMPTS:
+                      logging.error(
+                          "HTTP 429 persistente dopo %s tentativi: %s",
+                          MAX_HTTP_ATTEMPTS, url
+                      )
+                      return response
+
+                  retry_after = response.headers.get("Retry-After")
+                  delay = None
+                  if retry_after:
+                      try:
+                          delay = max(0, int(retry_after))
+                      except ValueError:
+                          try:
+                              retry_date = parsedate_to_datetime(retry_after)
+                              if retry_date.tzinfo is None:
+                                  retry_date = retry_date.replace(tzinfo=timezone.utc)
+                              delay = max(
+                                  0,
+                                  int((retry_date - datetime.now(timezone.utc)).total_seconds())
+                              )
+                          except Exception:
+                              delay = None
+
+                  if delay is None:
+                      delay = 2 ** attempt
+                  delay = min(delay, 30)
+                  logging.warning(
+                      "HTTP 429: tentativo %s/%s. Nuovo tentativo tra %s secondi.",
+                      attempt, MAX_HTTP_ATTEMPTS, delay
+                  )
+                  time.sleep(delay)
+              return response
+
           def parse_date(value):
               if not value:
                   return None
               try:
-                  dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                  dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
                   if dt.tzinfo is None:
                       dt = dt.replace(tzinfo=timezone.utc)
                   return dt.astimezone(timezone.utc)
               except Exception:
                   pass
               try:
-                  from email.utils import parsedate_to_datetime
                   dt = parsedate_to_datetime(value)
                   if dt.tzinfo is None:
                       dt = dt.replace(tzinfo=timezone.utc)
                   return dt.astimezone(timezone.utc)
               except Exception:
-                  return None
+                  pass
+              for fmt in (
+                  "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y",
+                  "%B %d, %Y", "%b %d, %Y"
+              ):
+                  try:
+                      return datetime.strptime(
+                          str(value).strip(), fmt
+                      ).replace(tzinfo=timezone.utc)
+                  except Exception:
+                      continue
+              return None
 
           def normalize_url(url):
               if not url:
@@ -163,60 +264,506 @@ jobs:
                   ""
               ))
 
-          def is_relevant(text):
-              value = (text or "").lower()
-              return (
-                  "the weeknd" in value
-                  or "abel tesfaye" in value
-              )
-
-          def article_text(url):
+          def get_domain(url):
               try:
-                  response = SESSION.get(url, timeout=15)
+                  return parse_url(url).netloc.lower().replace("www.", "")
+              except Exception:
+                  return ""
+
+          def source_priority(url):
+              domain = get_domain(url)
+              for known_domain, priority in SOURCE_PRIORITY.items():
+                  if domain == known_domain or domain.endswith("." + known_domain):
+                      return priority
+              return 3
+
+          def extract_jsonld_dates(data):
+              dates = []
+              if isinstance(data, list):
+                  for item in data:
+                      dates.extend(extract_jsonld_dates(item))
+              elif isinstance(data, dict):
+                  for key in ("datePublished", "dateCreated"):
+                      value = data.get(key)
+                      if isinstance(value, str):
+                          parsed = parse_date(value)
+                          if parsed:
+                              dates.append(parsed)
+                  graph = data.get("@graph")
+                  if graph:
+                      dates.extend(extract_jsonld_dates(graph))
+              return dates
+
+          def extract_original_publication_date(soup):
+              dates = []
+              for script in soup.find_all("script", type="application/ld+json"):
+                  try:
+                      data = json.loads(script.string or script.get_text())
+                      dates.extend(extract_jsonld_dates(data))
+                  except Exception:
+                      continue
+
+              date_attributes = [
+                  ("property", "article:published_time"),
+                  ("property", "og:published_time"),
+                  ("name", "datePublished"),
+                  ("name", "date"),
+                  ("name", "pubdate"),
+                  ("name", "publishdate"),
+                  ("name", "publication_date"),
+                  ("name", "parsely-pub-date"),
+                  ("name", "sailthru.date"),
+                  ("itemprop", "datePublished")
+              ]
+              for attribute, expected in date_attributes:
+                  tag = soup.find("meta", attrs={attribute: expected})
+                  if tag and tag.get("content"):
+                      parsed = parse_date(tag.get("content"))
+                      if parsed:
+                          dates.append(parsed)
+
+              for tag in soup.find_all("time"):
+                  if tag.get("datetime"):
+                      parsed = parse_date(tag.get("datetime"))
+                      if parsed:
+                          dates.append(parsed)
+
+              return min(dates) if dates else None
+
+          def resolve_google_url(link):
+              try:
+                  parts = urllib.parse.urlsplit(link)
+                  if "news.google.com" not in parts.netloc:
+                      return link
+
+                  article_id = parts.path.rstrip("/").split("/")[-1]
+                  page = request_with_retry(SESSION.get, link, timeout=25)
+                  page.raise_for_status()
+
+                  match_sg = re.search(r'data-n-a-sg="([^"]+)"', page.text)
+                  match_ts = re.search(r'data-n-a-ts="([^"]+)"', page.text)
+                  if not match_sg or not match_ts:
+                      logging.warning("Google non ha fornito i dati per risolvere il link.")
+                      return None
+
+                  inner = (
+                      '["garturlreq",[["X","X",["X","X"],null,null,1,1,'
+                      '"US:en",null,1,null,null,null,null,null,0,1],'
+                      '"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+                      f'"{article_id}",{match_ts.group(1)},"{match_sg.group(1)}"]'
+                  )
+                  payload = json.dumps([[["Fbv4je", inner, None, "generic"]]])
+                  response = request_with_retry(
+                      SESSION.post,
+                      "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                      params={"rpcids": "Fbv4je"},
+                      data={"f.req": payload},
+                      headers={
+                          "Content-Type":
+                          "application/x-www-form-urlencoded;charset=UTF-8"
+                      },
+                      timeout=25
+                  )
+                  response.raise_for_status()
+                  raw = response.text.split("\n\n", 1)[-1].strip()
+                  if raw.startswith(")]}'"):
+                      raw = raw[4:].strip()
+                  data = json.loads(raw)
+                  row = data[0][2]
+                  if not row:
+                      return None
+                  real_url = json.loads(row)[1]
+                  return real_url if real_url.startswith("https://") else None
+              except Exception as exc:
+                  logging.warning("Risoluzione link non riuscita: %s", exc)
+                  return None
+
+          def get_article_data(url):
+              try:
+                  response = request_with_retry(SESSION.get, url, timeout=20)
                   response.raise_for_status()
                   soup = BeautifulSoup(response.text, "html.parser")
+                  publication_date = extract_original_publication_date(soup)
+                  article_text = ""
 
-                  for script in soup.find_all(
-                      "script", type="application/ld+json"
-                  ):
+                  for script in soup.find_all("script", type="application/ld+json"):
                       try:
                           data = json.loads(script.string or script.get_text())
                           objects = data if isinstance(data, list) else [data]
                           for obj in objects:
                               if isinstance(obj, dict):
                                   body = obj.get("articleBody")
-                                  if body and len(body) > 150:
-                                      return body
+                                  if body and len(body) > 100:
+                                      article_text = body
+                                      break
+                          if article_text:
+                              break
                       except Exception:
                           continue
 
-                  paragraphs = [
-                      p.get_text(" ", strip=True)
-                      for p in soup.find_all("p")
-                  ]
-                  text = " ".join(p for p in paragraphs if len(p) > 35)
-                  if len(text) > 150:
-                      return text
+                  if not article_text:
+                      paragraphs = [
+                          p.get_text(" ", strip=True)
+                          for p in soup.find_all("p")
+                      ]
+                      article_text = " ".join(
+                          p for p in paragraphs if len(p) > 40
+                      )
+                  return article_text, publication_date
 
-                  description = soup.find(
-                      "meta", attrs={"name": "description"}
-                  )
-                  if description:
-                      return description.get("content", "")
+              except requests.HTTPError as exc:
+                  status = exc.response.status_code if exc.response is not None else "sconosciuto"
+                  if status == 403:
+                      logging.warning(
+                          "Accesso negato (403): il sito non consente la lettura automatica."
+                      )
+                  else:
+                      logging.warning("Errore HTTP durante la lettura: %s", exc)
+                  return "", None
               except Exception as exc:
-                  logging.warning("Lettura articolo fallita: %s", exc)
+                  logging.warning("Impossibile leggere l'articolo: %s", exc)
+                  return "", None
+
+          def title_tokens(title):
+              normalized = title.lower()
+              normalized = re.sub(r"the\s+weeknd|abel\s+tesfaye", " ", normalized)
+              normalized = re.sub(r"paris[-\s]+saint[-\s]+germain", " psg ", normalized)
+              normalized = re.sub(r"grand\s+theft\s+auto\s+(?:vi|6)", " gta ", normalized)
+              words = re.findall(r"[a-z0-9à-ÿ]+", normalized)
+              return {
+                  word for word in words
+                  if len(word) > 2 and word not in STOP_WORDS
+              }
+
+          def is_psg_xo_collection(title):
+              normalized = title.lower()
+              has_psg = bool(re.search(r"\bpsg\b|paris[-\s]+saint[-\s]+germain", normalized))
+              has_xo = bool(re.search(r"\bxo\b", normalized))
+              has_collection = bool(re.search(
+                  r"collection|collaboration|collab|lifestyle|apparel|clothing|fashion",
+                  normalized
+              ))
+              return has_psg and has_xo and has_collection
+
+          def is_gta_justice_story(title):
+              normalized = title.lower()
+              has_gta = bool(re.search(
+                  r"\bgta\s*(?:vi|6)\b|\bgrand\s+theft\s+auto\s+(?:vi|6)\b",
+                  normalized
+              ))
+              has_justice = bool(re.search(r"\bjustice\b", normalized))
+              return has_gta and has_justice and bool(ARTIST_RE.search(title))
+
+          def is_song_page(title):
+              normalized = title.lower()
+              track_listing = bool(re.search(
+                  r"the\s+weeknd\s*[–—-].{1,100}\b(?:ft\.?|feat\.?|featuring)\b",
+                  normalized
+              ))
+              page_markers = bool(re.search(
+                  r"\b(song lyrics|lyrics|official audio|official video|music video|"
+                  r"mp3 download|download mp3|listen to|tracklist)\b",
+                  normalized
+              ))
+              return track_listing or page_markers
+
+          def is_evergreen_content(title):
+              normalized = title.lower()
+              patterns = [
+                  r"\bwatch collection\b", r"\bunconventional watch\b",
+                  r"\bstyle guide\b", r"\bfashion guide\b", r"\bwardrobe\b",
+                  r"\bmenswear\b", r"\bmen's jewelry\b", r"\bjewelry collection\b",
+                  r"\btop \d+", r"\bbest of\b",
+                  r"\beverything you need to know\b", r"\bcomplete guide\b"
+              ]
+              return any(re.search(pattern, normalized) for pattern in patterns)
+
+          def is_low_value_content(title):
+              if is_song_page(title):
+                  return "pagina musicale o scheda di una canzone"
+              if is_evergreen_content(title):
+                  return "contenuto evergreen, guida o approfondimento non attuale"
+              return None
+
+          def same_story(title_a, title_b):
+              if is_gta_justice_story(title_a) and is_gta_justice_story(title_b):
+                  return True
+              if is_psg_xo_collection(title_a) and is_psg_xo_collection(title_b):
+                  return True
+              a = title_tokens(title_a)
+              b = title_tokens(title_b)
+              if not a or not b:
+                  return False
+              common = a.intersection(b)
+              if len(common) >= 3:
+                  overlap = len(common) / min(len(a), len(b))
+                  if overlap >= 0.60:
+                      return True
+              ratio = SequenceMatcher(
+                  None, " ".join(sorted(a)), " ".join(sorted(b))
+              ).ratio()
+              return ratio >= 0.82
+
+          def candidate_score(item):
+              return (
+                  -source_priority(item["url"]),
+                  item["date"].timestamp(),
+                  item["text_length"]
+              )
+
+          def collect_news():
+              results = {}
+              counters = {
+                  "title": 0, "text": 0, "link": 0, "duplicate": 0,
+                  "old": 0, "future": 0, "unknown": 0, "low": 0
+              }
+
+              for query, language, country, edition in QUERIES:
+                  params = {
+                      "q": query + " when:1d",
+                      "hl": language,
+                      "gl": country,
+                      "ceid": edition
+                  }
+                  feed_url = (
+                      "https://news.google.com/rss/search?"
+                      + urllib.parse.urlencode(params)
+                  )
+                  logging.info("Ricerca Google News: %s (%s)", query, edition)
+
+                  try:
+                      response = request_with_retry(
+                          SESSION.get, feed_url, timeout=25
+                      )
+                      response.raise_for_status()
+                      feed = feedparser.parse(response.content)
+                      logging.info("Risultati RSS ricevuti: %s", len(feed.entries))
+
+                      for entry in feed.entries:
+                          title = entry.get("title", "").strip()
+                          published = parse_date(entry.get("published"))
+                          link = entry.get("link", "")
+                          if not title or not link or not published:
+                              continue
+                          if published < CUTOFF or published > NOW:
+                              continue
+                          key = title.lower()
+                          if key not in results:
+                              results[key] = {
+                                  "title": title,
+                                  "date": published,
+                                  "google_link": link
+                              }
+                  except Exception as exc:
+                      logging.error("Errore ricerca Google News: %s", exc)
+
+              logging.info("Risultati unici nelle ultime 24 ore: %s", len(results))
+              ordered = sorted(
+                  results.values(), key=lambda x: x["date"], reverse=True
+              )
+              candidates = []
+
+              for item in ordered[:MAX_CANDIDATES]:
+                  title = item["title"]
+                  logging.info("-" * 60)
+                  logging.info("Controllo: %s", title)
+
+                  if not ARTIST_RE.search(title):
+                      counters["title"] += 1
+                      logging.info("SCARTATO: il titolo non cita direttamente l'artista.")
+                      continue
+
+                  low_value_reason = is_low_value_content(title)
+                  if low_value_reason:
+                      counters["low"] += 1
+                      logging.info("SCARTATO: %s.", low_value_reason)
+                      continue
+
+                  original_url = resolve_google_url(item["google_link"])
+                  if not original_url:
+                      counters["link"] += 1
+                      logging.info("SCARTATO: link originale non risolto.")
+                      continue
+
+                  canonical_url = normalize_url(original_url)
+                  if canonical_url in state["news"]:
+                      logging.info("GIÀ PUBBLICATO: %s", title)
+                      continue
+
+                  text, original_date = get_article_data(original_url)
+                  if not text:
+                      counters["text"] += 1
+                      logging.info("SCARTATO: testo dell'articolo non accessibile.")
+                      continue
+
+                  if not ARTIST_RE.search(text):
+                      counters["text"] += 1
+                      logging.info("SCARTATO: il testo non conferma il riferimento all'artista.")
+                      continue
+
+                  if not original_date:
+                      counters["unknown"] += 1
+                      logging.info("SCARTATO: data originale non verificabile.")
+                      continue
+
+                  logging.info("Data originale articolo: %s", original_date.isoformat())
+                  if original_date < CUTOFF:
+                      counters["old"] += 1
+                      logging.info("SCARTATO: articolo pubblicato oltre 24 ore fa.")
+                      continue
+                  if original_date > NOW:
+                      counters["future"] += 1
+                      logging.info("SCARTATO: data originale successiva all'esecuzione.")
+                      continue
+
+                  candidate = {
+                      "title": title,
+                      "date": original_date,
+                      "url": original_url,
+                      "canonical_url": canonical_url,
+                      "text": text,
+                      "text_length": len(text),
+                      "domain": get_domain(original_url)
+                  }
+                  candidates.append(candidate)
+                  logging.info(
+                      "CANDIDATO VALIDO | Fonte: %s | Priorità: %s",
+                      candidate["domain"], source_priority(original_url)
+                  )
+
+              candidates.sort(key=candidate_score, reverse=True)
+              unique_candidates = []
+
+              for candidate in candidates:
+                  duplicate = next(
+                      (
+                          previous for previous in unique_candidates
+                          if same_story(candidate["title"], previous["title"])
+                      ),
+                      None
+                  )
+                  if duplicate:
+                      counters["duplicate"] += 1
+                      logging.info(
+                          "DUPLICATO: '%s' accorpato a '%s'.",
+                          candidate["title"], duplicate["title"]
+                      )
+                      continue
+                  unique_candidates.append(candidate)
+
+              selected = unique_candidates[:MAX_ARTICLES]
+              logging.info("=" * 60)
+              logging.info("RIEPILOGO RICERCA NEWS")
+              logging.info("Candidati validi esaminati: %s", len(candidates))
+              logging.info("Articoli unici dopo deduplicazione: %s", len(unique_candidates))
+              logging.info("Articoli finali selezionati: %s", len(selected))
+              logging.info("Scartati per titolo non pertinente: %s", counters["title"])
+              logging.info("Scartati per testo non accessibile/non pertinente: %s", counters["text"])
+              logging.info("Scartati come duplicati: %s", counters["duplicate"])
+              logging.info("Scartati per link non risolto: %s", counters["link"])
+              logging.info("Scartati per data troppo vecchia: %s", counters["old"])
+              logging.info("Scartati per data futura: %s", counters["future"])
+              logging.info("Scartati per data non verificabile: %s", counters["unknown"])
+              logging.info("Scartati come evergreen/pagine musicali: %s", counters["low"])
+              for index, item in enumerate(selected, 1):
+                  logging.info(
+                      "%s. %s | %s | %s | %s",
+                      index, item["title"], item["domain"],
+                      item["date"].isoformat(), item["url"]
+                  )
+              return selected
+
+          def youtube_id(url):
+              if not url:
+                  return ""
+              parts = urlsplit(url)
+              if parts.netloc.endswith("youtu.be"):
+                  return parts.path.strip("/")
+              if "youtube.com" in parts.netloc:
+                  return parse_qs(parts.query).get("v", [""])[0]
               return ""
+
+          def collect_videos():
+              videos = {}
+              cutoff = NOW - timedelta(hours=24) if FIRST_RUN else VIDEO_CUTOFF
+
+              def add_video(video_id, title, url, date):
+                  if not video_id or not title or not date:
+                      return
+                  if date < cutoff or date > NOW:
+                      return
+                  if video_id in state["videos"]:
+                      return
+                  videos[video_id] = {
+                      "id": video_id, "title": title,
+                      "url": url, "date": date
+                  }
+
+              try:
+                  feed = feedparser.parse(OFFICIAL_YOUTUBE_RSS)
+                  for entry in feed.entries:
+                      url = entry.get("link", "")
+                      video_id = entry.get("yt_videoid") or youtube_id(url)
+                      date = parse_date(entry.get("published") or entry.get("updated"))
+                      add_video(video_id, entry.get("title", ""), url, date)
+              except Exception as exc:
+                  logging.warning("RSS YouTube ufficiale: %s", exc)
+
+              searches = [
+                  "The Weeknd interview",
+                  "The Weeknd live performance",
+                  "Abel Tesfaye interview"
+              ]
+              ydl_options = {
+                  "quiet": True,
+                  "no_warnings": True,
+                  "extract_flat": True,
+                  "skip_download": True,
+                  "playlistend": 12,
+                  "socket_timeout": 15
+              }
+              try:
+                  with yt_dlp.YoutubeDL(ydl_options) as ydl:
+                      for query in searches:
+                          try:
+                              result = ydl.extract_info(
+                                  f"ytsearch8:{query}", download=False
+                              )
+                              for item in result.get("entries", []) or []:
+                                  if not item:
+                                      continue
+                                  video_id = item.get("id", "")
+                                  url = item.get("url", "")
+                                  if video_id and not url.startswith("http"):
+                                      url = "https://www.youtube.com/watch?v=" + video_id
+                                  date_string = item.get("upload_date") or item.get("release_date")
+                                  date = None
+                                  if date_string and len(date_string) == 8:
+                                      try:
+                                          date = datetime.strptime(
+                                              date_string, "%Y%m%d"
+                                          ).replace(tzinfo=timezone.utc)
+                                      except Exception:
+                                          pass
+                                  add_video(video_id, item.get("title", ""), url, date)
+                          except Exception as exc:
+                              logging.warning("Ricerca YouTube '%s': %s", query, exc)
+              except Exception as exc:
+                  logging.warning("yt-dlp non disponibile: %s", exc)
+
+              result = sorted(
+                  videos.values(), key=lambda item: item["date"], reverse=True
+              )
+              logging.info("Nuovi video YouTube: %s", len(result[:8]))
+              return result[:8]
 
           def translate_google(text):
               try:
                   response = SESSION.get(
                       "https://translate.googleapis.com/translate_a/single",
                       params={
-                          "client": "gtx",
-                          "sl": "en",
-                          "tl": "it",
-                          "dt": "t",
-                          "q": text[:4500]
+                          "client": "gtx", "sl": "en", "tl": "it",
+                          "dt": "t", "q": text[:4500]
                       },
                       timeout=15
                   )
@@ -233,10 +780,7 @@ jobs:
               try:
                   response = SESSION.get(
                       "https://api.mymemory.translated.net/get",
-                      params={
-                          "q": text[:450],
-                          "langpair": "en|it"
-                      },
+                      params={"q": text[:450], "langpair": "en|it"},
                       timeout=15
                   )
                   response.raise_for_status()
@@ -251,200 +795,77 @@ jobs:
           def summarize(text):
               if not text:
                   return "Testo dell'articolo non disponibile."
-
               text = re.sub(r"\s+", " ", text).strip()
               sentences = re.split(r"(?<=[.!?])\s+", text)
               summary = " ".join(sentences[:4]).strip()
-
               translated = translate_google(summary)
               if not translated:
                   translated = translate_mymemory(summary)
+              return translated if translated else "Traduzione non disponibile."
 
-              if translated:
-                  return translated
+          def safe(value):
+              return html.escape(str(value or ""), quote=False)
 
-              return "Traduzione non disponibile."
+          def add_if_fits(parts, block):
+              candidate = "\n".join(parts + [block])
+              if len(candidate) <= MAX_TELEGRAM_LENGTH:
+                  parts.append(block)
+                  return True
+              return False
 
-          def collect_news():
-              found = []
-              seen_this_run = set()
-
-              for feed_url in RSS_FEEDS:
-                  try:
-                      feed = feedparser.parse(feed_url)
-                      logging.info(
-                          "Feed %s: %s articoli",
-                          feed_url, len(feed.entries)
-                      )
-
-                      for entry in feed.entries:
-                          title = entry.get("title", "").strip()
-                          url = normalize_url(entry.get("link", ""))
-                          published = parse_date(
-                              entry.get("published")
-                              or entry.get("updated")
-                          )
-
-                          if not title or not url or not published:
-                              continue
-
-                          if published < NEWS_CUTOFF or published > NOW:
-                              continue
-
-                          if not is_relevant(title):
-                              continue
-
-                          if url in seen_this_run or url in state["news"]:
-                              continue
-
-                          combined = title.lower()
-                          if any(word in combined for word in (
-                              "playstation", "xbox", "gaming",
-                              "videogame", "video game"
-                          )):
-                              continue
-
-                          seen_this_run.add(url)
-                          found.append({
-                              "title": title,
-                              "url": url,
-                              "published": published
-                          })
-                  except Exception as exc:
-                      logging.warning("Errore feed RSS: %s", exc)
-
-              found.sort(
-                  key=lambda item: item["published"],
-                  reverse=True
-              )
-              return found[:5]
-
-          def youtube_id(url):
-              if not url:
-                  return ""
-              parts = urlsplit(url)
-              if parts.netloc.endswith("youtu.be"):
-                  return parts.path.strip("/")
-              if "youtube.com" in parts.netloc:
-                  return parse_qs(parts.query).get("v", [""])[0]
-              return ""
-
-          def collect_videos():
-              videos = {}
-              cutoff = (
-                  NOW - timedelta(hours=24)
-                  if FIRST_RUN else VIDEO_CUTOFF
-              )
-
-              def add_video(video_id, title, url, date):
-                  if not video_id or not title or not date:
-                      return
-                  if date < cutoff or date > NOW:
-                      return
-                  if video_id in state["videos"]:
-                      return
-                  videos[video_id] = {
-                      "id": video_id,
-                      "title": title,
-                      "url": url,
-                      "date": date
-                  }
-
-              # Canale YouTube ufficiale
-              try:
-                  feed = feedparser.parse(OFFICIAL_YOUTUBE_RSS)
-                  for entry in feed.entries:
-                      url = entry.get("link", "")
-                      video_id = (
-                          entry.get("yt_videoid")
-                          or youtube_id(url)
-                      )
-                      date = parse_date(
-                          entry.get("published")
-                          or entry.get("updated")
-                      )
-                      add_video(
-                          video_id,
-                          entry.get("title", ""),
-                          url,
-                          date
-                      )
-              except Exception as exc:
-                  logging.warning("RSS YouTube ufficiale: %s", exc)
-
-              # Altri video, interviste e performance
-              searches = [
-                  "The Weeknd interview",
-                  "The Weeknd live performance",
-                  "Abel Tesfaye interview"
+          def build_message(news, videos):
+              parts = [
+                  "🖤 <b>XO DAILY NEWS</b>",
+                  "<i>Le ultime novità su The Weeknd</i>",
+                  "",
+                  "📰 <b>NEWS</b>"
               ]
 
-              ydl_options = {
-                  "quiet": True,
-                  "no_warnings": True,
-                  "extract_flat": True,
-                  "skip_download": True,
-                  "playlistend": 12,
-                  "socket_timeout": 15
-              }
+              if not news:
+                  add_if_fits(parts, "Nessuna nuova notizia verificata nelle ultime 24 ore.")
+              else:
+                  for index, item in enumerate(news, 1):
+                      summary = summarize(item["text"])
+                      summary = summary[:320].rsplit(" ", 1)[0]
+                      title = item["title"][:180]
+                      url = html.escape(item["url"], quote=True)
+                      block = (
+                          f"<b>{index}. {safe(title)}</b>\n"
+                          f"{safe(summary)}\n"
+                          f'🔗 <a href="{url}">Leggi la notizia</a>'
+                      )
+                      if not add_if_fits(parts, block):
+                          logging.warning(
+                              "Notizia %s esclusa dal messaggio per limite caratteri.",
+                              index
+                          )
 
-              try:
-                  with yt_dlp.YoutubeDL(ydl_options) as ydl:
-                      for query in searches:
-                          try:
-                              result = ydl.extract_info(
-                                  f"ytsearch8:{query}",
-                                  download=False
-                              )
-                              for item in result.get("entries", []) or []:
-                                  if not item:
-                                      continue
-                                  video_id = item.get("id", "")
-                                  url = item.get("url", "")
-                                  if video_id and not url.startswith("http"):
-                                      url = (
-                                          "https://www.youtube.com/watch?v="
-                                          + video_id
-                                      )
+              add_if_fits(parts, "\n🎬 <b>YOUTUBE</b>")
+              if videos:
+                  for item in videos[:4]:
+                      title = item["title"][:120]
+                      url = html.escape(item["url"], quote=True)
+                      block = f'▶️ <a href="{url}">{safe(title)}</a>'
+                      if not add_if_fits(parts, block):
+                          logging.warning("Video escluso per limite caratteri.")
+                          break
+              else:
+                  add_if_fits(parts, "Nessun nuovo video recente.")
 
-                                  date_string = (
-                                      item.get("upload_date")
-                                      or item.get("release_date")
-                                  )
-                                  date = None
-                                  if date_string and len(date_string) == 8:
-                                      try:
-                                          date = datetime.strptime(
-                                              date_string, "%Y%m%d"
-                                          ).replace(tzinfo=timezone.utc)
-                                      except Exception:
-                                          pass
-
-                                  add_video(
-                                      video_id,
-                                      item.get("title", ""),
-                                      url,
-                                      date
-                                  )
-                          except Exception as exc:
-                              logging.warning(
-                                  "Ricerca YouTube '%s': %s",
-                                  query, exc
-                              )
-              except Exception as exc:
-                  logging.warning("yt-dlp non disponibile: %s", exc)
-
-              result = sorted(
-                  videos.values(),
-                  key=lambda item: item["date"],
-                  reverse=True
-              )
-              return result[:8]
+              add_if_fits(parts, "\n📸 <b>INSTAGRAM</b>")
+              for name, url in INSTAGRAM_LINKS:
+                  add_if_fits(
+                      parts,
+                      f'• <a href="{html.escape(url, quote=True)}">{safe(name)}</a>'
+                  )
+              add_if_fits(parts, "\n🖤 XO till we overdose!")
+              message = "\n".join(parts)
+              if len(message) > MAX_TELEGRAM_LENGTH:
+                  raise ValueError("Messaggio Telegram oltre il limite di sicurezza.")
+              return message
 
           def telegram_send(message):
-              url = (
-                  f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-              )
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
               payload = {
                   "chat_id": CHAT_ID,
                   "message_thread_id": THREAD_ID,
@@ -455,9 +876,16 @@ jobs:
 
               for attempt in range(3):
                   try:
-                      response = SESSION.post(
-                          url, json=payload, timeout=20
-                      )
+                      response = SESSION.post(url, json=payload, timeout=20)
+                      if response.status_code == 429:
+                          try:
+                              delay = int(response.json().get("parameters", {}).get("retry_after", 3))
+                          except Exception:
+                              delay = 3
+                          logging.warning("Telegram rate limit: attesa %s secondi.", delay)
+                          if attempt < 2:
+                              time.sleep(min(delay, 30))
+                              continue
                       response.raise_for_status()
                       result = response.json()
                       if result.get("ok"):
@@ -465,61 +893,11 @@ jobs:
                       logging.error("Telegram: %s", result)
                   except Exception as exc:
                       logging.warning(
-                          "Invio Telegram tentativo %s: %s",
-                          attempt + 1, exc
+                          "Invio Telegram tentativo %s: %s", attempt + 1, exc
                       )
                   if attempt < 2:
-                      import time
                       time.sleep(3)
-
               return False
-
-          def safe(text):
-              return html.escape(str(text or ""), quote=False)
-
-          def build_message(news, videos):
-              parts = [
-                  "🖤 <b>XO DAILY NEWS</b>",
-                  "<i>Le ultime novità su The Weeknd</i>",
-                  ""
-              ]
-
-              parts.append("📰 <b>NEWS</b>")
-              if news:
-                  for index, item in enumerate(news, 1):
-                      parts.extend([
-                          f"<b>{index}. {safe(item['title'])}</b>",
-                          safe(summarize(article_text(item["url"]))),
-                          f"🔗 <a href=\"{html.escape(item['url'], quote=True)}\">Leggi la notizia</a>",
-                          ""
-                      ])
-              else:
-                  parts.extend([
-                      "Nessuna nuova notizia nelle ultime 24 ore.",
-                      ""
-                  ])
-
-              parts.append("🎬 <b>YOUTUBE</b>")
-              if videos:
-                  for item in videos:
-                      parts.extend([
-                          f"▶️ <a href=\"{html.escape(item['url'], quote=True)}\">{safe(item['title'])}</a>",
-                          ""
-                      ])
-              else:
-                  parts.extend([
-                      "Nessun nuovo video recente.",
-                      ""
-                  ])
-
-              parts.append("📸 <b>INSTAGRAM</b>")
-              for name, url in INSTAGRAM_LINKS:
-                  parts.append(
-                      f'• <a href="{url}">{safe(name)}</a>'
-                  )
-
-              parts.extend(["", "🖤 XO till we overdose!"])
-              return "\n".join(parts)
 
           def main():
               logging.info("Avvio XO Daily News")
@@ -527,26 +905,23 @@ jobs:
 
               news = collect_news()
               videos = collect_videos()
-
               logging.info(
-                  "Nuove notizie: %s | Nuovi video: %s",
+                  "Notizie selezionate: %s | Video selezionati: %s",
                   len(news), len(videos)
               )
 
               message = build_message(news, videos)
+              logging.info("Lunghezza messaggio Telegram: %s caratteri", len(message))
 
               if telegram_send(message):
                   for item in news:
-                      state["news"][item["url"]] = NOW.isoformat()
+                      state["news"][item["canonical_url"]] = NOW.isoformat()
                   for item in videos:
                       state["videos"][item["id"]] = NOW.isoformat()
-
                   save_state()
                   logging.info("Messaggio inviato e memoria aggiornata.")
               else:
-                  logging.error(
-                      "Invio non riuscito: memoria non aggiornata."
-                  )
+                  logging.error("Invio non riuscito: memoria non aggiornata.")
                   raise SystemExit(1)
 
           if __name__ == "__main__":
