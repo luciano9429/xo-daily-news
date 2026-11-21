@@ -33,12 +33,13 @@ jobs:
           import requests
           import feedparser
           import urllib.parse
-          import urllib.parse as urlparse
           import json
           import re
           import logging
+          import time
           from datetime import datetime, timedelta, timezone
           from difflib import SequenceMatcher
+          from email.utils import parsedate_to_datetime
           from bs4 import BeautifulSoup
           from urllib.parse import urlparse as parse_url
 
@@ -51,6 +52,7 @@ jobs:
           CUTOFF = NOW - timedelta(hours=24)
           MAX_ARTICLES = 5
           MAX_CANDIDATES = 50
+          MAX_HTTP_ATTEMPTS = 4
 
           SESSION = requests.Session()
           SESSION.headers.update({
@@ -60,8 +62,73 @@ jobs:
               )
           })
 
-          # Ricerche ampie, senza vincoli tematici.
-          # USA, Regno Unito, Canada e Italia.
+          def request_with_retry(method, url, **kwargs):
+              """
+              Ripete la richiesta in caso di HTTP 429.
+              Rispetta Retry-After quando disponibile.
+              Non riprova gli errori 403.
+              """
+              for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+                  response = method(url, **kwargs)
+
+                  if response.status_code != 429:
+                      return response
+
+                  if attempt == MAX_HTTP_ATTEMPTS:
+                      logging.error(
+                          "HTTP 429 persistente dopo %s tentativi: %s",
+                          MAX_HTTP_ATTEMPTS,
+                          url
+                      )
+                      return response
+
+                  retry_after = response.headers.get("Retry-After")
+                  delay = None
+
+                  if retry_after:
+                      try:
+                          delay = max(0, int(retry_after))
+                      except ValueError:
+                          try:
+                              retry_date = parsedate_to_datetime(
+                                  retry_after
+                              )
+
+                              if retry_date.tzinfo is None:
+                                  retry_date = retry_date.replace(
+                                      tzinfo=timezone.utc
+                                  )
+
+                              delay = max(
+                                  0,
+                                  int(
+                                      (
+                                          retry_date
+                                          - datetime.now(timezone.utc)
+                                      ).total_seconds()
+                                  )
+                              )
+                          except Exception:
+                              delay = None
+
+                  if delay is None:
+                      delay = 2 ** attempt
+
+                  delay = min(delay, 30)
+
+                  logging.warning(
+                      "HTTP 429: tentativo %s/%s. "
+                      "Nuovo tentativo tra %s secondi.",
+                      attempt,
+                      MAX_HTTP_ATTEMPTS,
+                      delay
+                  )
+
+                  time.sleep(delay)
+
+              return response
+
+          # Ricerche ampie: USA, Regno Unito, Canada e Italia.
           QUERIES = [
               ('"The Weeknd"', "en-US", "US", "US:en"),
               ('"Abel Tesfaye"', "en-US", "US", "US:en"),
@@ -114,7 +181,9 @@ jobs:
 
           def get_domain(url):
               try:
-                  return parse_url(url).netloc.lower().replace("www.", "")
+                  return parse_url(url).netloc.lower().replace(
+                      "www.", ""
+                  )
               except Exception:
                   return ""
 
@@ -122,7 +191,10 @@ jobs:
               domain = get_domain(url)
 
               for known_domain, priority in SOURCE_PRIORITY.items():
-                  if domain == known_domain or domain.endswith("." + known_domain):
+                  if (
+                      domain == known_domain
+                      or domain.endswith("." + known_domain)
+                  ):
                       return priority
 
               return 3
@@ -145,7 +217,6 @@ jobs:
                   pass
 
               try:
-                  from email.utils import parsedate_to_datetime
                   dt = parsedate_to_datetime(value)
 
                   if dt.tzinfo is None:
@@ -164,7 +235,9 @@ jobs:
                   "%b %d, %Y"
               ):
                   try:
-                      dt = datetime.strptime(str(value).strip(), fmt)
+                      dt = datetime.strptime(
+                          str(value).strip(), fmt
+                      )
                       return dt.replace(tzinfo=timezone.utc)
                   except Exception:
                       continue
@@ -253,14 +326,20 @@ jobs:
 
           def resolve_google_url(link):
               try:
-                  parts = urlparse.urlsplit(link)
+                  parts = urllib.parse.urlsplit(link)
 
                   if "news.google.com" not in parts.netloc:
                       return link
 
-                  article_id = parts.path.rstrip("/").split("/")[-1]
+                  article_id = (
+                      parts.path.rstrip("/").split("/")[-1]
+                  )
 
-                  page = SESSION.get(link, timeout=25)
+                  page = request_with_retry(
+                      SESSION.get,
+                      link,
+                      timeout=25
+                  )
                   page.raise_for_status()
 
                   match_sg = re.search(
@@ -275,7 +354,8 @@ jobs:
 
                   if not match_sg or not match_ts:
                       logging.warning(
-                          "Google non ha fornito i dati per risolvere il link."
+                          "Google non ha fornito i dati "
+                          "per risolvere il link."
                       )
                       return None
 
@@ -293,7 +373,8 @@ jobs:
                       [[["Fbv4je", inner, None, "generic"]]]
                   )
 
-                  response = SESSION.post(
+                  response = request_with_retry(
+                      SESSION.post,
                       "https://news.google.com/_/DotsSplashUi/data/batchexecute",
                       params={"rpcids": "Fbv4je"},
                       data={"f.req": payload},
@@ -327,21 +408,26 @@ jobs:
 
               except Exception as exc:
                   logging.warning(
-                      "Risoluzione link non riuscita: %s", exc
+                      "Risoluzione link non riuscita: %s",
+                      exc
                   )
                   return None
 
           def get_article_data(url):
               try:
-                  response = SESSION.get(url, timeout=20)
+                  response = request_with_retry(
+                      SESSION.get,
+                      url,
+                      timeout=20
+                  )
                   response.raise_for_status()
 
                   soup = BeautifulSoup(
                       response.text, "html.parser"
                   )
 
-                  publication_date = extract_original_publication_date(
-                      soup
+                  publication_date = (
+                      extract_original_publication_date(soup)
                   )
 
                   article_text = ""
@@ -385,9 +471,30 @@ jobs:
 
                   return article_text, publication_date
 
+              except requests.HTTPError as exc:
+                  status = (
+                      exc.response.status_code
+                      if exc.response is not None
+                      else "sconosciuto"
+                  )
+
+                  if status == 403:
+                      logging.warning(
+                          "Accesso negato (403): "
+                          "il sito non consente la lettura automatica."
+                      )
+                  else:
+                      logging.warning(
+                          "Errore HTTP durante la lettura: %s",
+                          exc
+                      )
+
+                  return "", None
+
               except Exception as exc:
                   logging.warning(
-                      "Impossibile leggere l'articolo: %s", exc
+                      "Impossibile leggere l'articolo: %s",
+                      exc
                   )
                   return "", None
 
@@ -513,7 +620,10 @@ jobs:
                   return "pagina musicale o scheda di una canzone"
 
               if is_evergreen_content(title):
-                  return "contenuto evergreen, guida o approfondimento non attuale"
+                  return (
+                      "contenuto evergreen, guida o "
+                      "approfondimento non attuale"
+                  )
 
               return None
 
@@ -577,12 +687,15 @@ jobs:
 
                   logging.info(
                       "Ricerca Google News: %s (%s)",
-                      query, edition
+                      query,
+                      edition
                   )
 
                   try:
-                      response = SESSION.get(
-                          feed_url, timeout=25
+                      response = request_with_retry(
+                          SESSION.get,
+                          feed_url,
+                          timeout=25
                       )
                       response.raise_for_status()
 
@@ -617,7 +730,8 @@ jobs:
 
                   except Exception as exc:
                       logging.error(
-                          "Errore ricerca Google News: %s", exc
+                          "Errore ricerca Google News: %s",
+                          exc
                       )
 
               logging.info(
@@ -690,14 +804,16 @@ jobs:
                   if not ARTIST_RE.search(text):
                       rejected_text += 1
                       logging.info(
-                          "SCARTATO: il testo non conferma il riferimento all'artista."
+                          "SCARTATO: il testo non conferma "
+                          "il riferimento all'artista."
                       )
                       continue
 
                   if not original_date:
                       rejected_unknown_date += 1
                       logging.info(
-                          "SCARTATO: data originale di pubblicazione non verificabile."
+                          "SCARTATO: data originale di pubblicazione "
+                          "non verificabile."
                       )
                       continue
 
